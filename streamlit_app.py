@@ -1,0 +1,585 @@
+import os
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import snowflake.connector
+import streamlit as st
+
+
+st.set_page_config(
+    page_title="After the Shock",
+    page_icon="🌾",
+    layout="wide",
+)
+
+COLORS = {
+    "plum": "#4B1735",
+    "rose": "#B77A91",
+    "cream": "#FAF4F6",
+    "gold": "#D7A84B",
+    "green": "#4F7A65",
+    "red": "#B94A48",
+    "gray": "#64748B",
+}
+
+st.markdown(
+    f"""
+    <style>
+    .stApp {{ background-color: {COLORS['cream']}; }}
+    .block-container {{ padding-top: 1.4rem; padding-bottom: 2rem; }}
+    h1, h2, h3 {{ color: {COLORS['plum']}; }}
+    [data-testid="stMetric"] {{
+        background: white;
+        border: 1px solid #eadce2;
+        border-radius: 12px;
+        padding: 14px;
+    }}
+    .callout {{
+        background: white;
+        border-left: 5px solid {COLORS['plum']};
+        border-radius: 8px;
+        padding: 1rem 1.2rem;
+        margin: .5rem 0 1rem 0;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+EVENT_SQL = """
+SELECT
+    ISO3, AREA_CODE_M49, COUNTRY, FAOSTAT_AREA, EVENT_YEAR, EVENT_TYPES,
+    TOTAL_FOCUS_EVENTS, DROUGHT_EVENTS, WILDFIRE_EVENTS,
+    EXTREME_TEMPERATURE_EVENTS, FLOOD_EVENTS, STORM_EVENTS,
+    TOTAL_AFFECTED_REPORTED, TOTAL_DEATHS_REPORTED,
+    TOTAL_DAMAGE_ADJUSTED_000_USD, BASELINE_YEAR_COUNT, BASELINE_INDEX,
+    EVENT_YEAR_INDEX, YEAR_1_INDEX, YEAR_2_INDEX, YEAR_3_INDEX,
+    WORST_INDEX_T_TO_T1, MAX_PRODUCTION_YEAR, EVENT_YEAR_CHANGE_PERCENT,
+    WORST_CHANGE_PERCENT_T_TO_T1, HAS_FULL_3_YEAR_FOLLOWUP,
+    RECOVERY_YEARS, RECOVERY_STATUS, RESILIENCE_CATEGORY,
+    FOOD_INSECURITY_PERCENT, UNDERNOURISHMENT_PERCENT,
+    FOOD_INSECURITY_IS_UPPER_BOUND, UNDERNOURISHMENT_IS_UPPER_BOUND
+FROM FAOSTAT_DB.ANALYTICS.VW_EVENT_PRODUCTION_RESILIENCE
+WHERE BASELINE_YEAR_COUNT >= 2
+  AND EVENT_YEAR_INDEX IS NOT NULL
+"""
+
+PRODUCTION_SQL = """
+SELECT AREA_CODE_M49, AREA, YEAR, FOOD_PRODUCTION_INDEX
+FROM FAOSTAT_DB.ANALYTICS.VW_FOOD_PRODUCTION_YEAR
+"""
+
+HAZARD_SQL = """
+SELECT DISASTER_NUMBER, ISO3, COUNTRY, START_YEAR, DISASTER_TYPE,
+       TOTAL_AFFECTED, TOTAL_DEATHS, TOTAL_DAMAGE_ADJUSTED_000_USD
+FROM FAOSTAT_DB.CLEAN.VW_EMDAT_EVENTS
+WHERE IS_ANALYSIS_YEAR = TRUE
+  AND IS_FOCUS_EVENT = TRUE
+"""
+
+HAZARDS = {
+    "Drought": "DROUGHT_EVENTS",
+    "Wildfire": "WILDFIRE_EVENTS",
+    "Extreme temperature": "EXTREME_TEMPERATURE_EVENTS",
+    "Flood": "FLOOD_EVENTS",
+    "Storm": "STORM_EVENTS",
+}
+
+
+def secret_value(key: str, default: str = "") -> str:
+    try:
+        section = st.secrets.get("snowflake", {})
+        return str(section.get(key, default))
+    except Exception:
+        return default
+
+
+@st.cache_resource(show_spinner=False)
+def connect_snowflake(
+    account: str,
+    user: str,
+    password: str,
+    warehouse: str,
+    database: str,
+    role: str,
+):
+    return snowflake.connector.connect(
+        account=account,
+        user=user,
+        password=password,
+        warehouse=warehouse,
+        database=database,
+        schema="ANALYTICS",
+        role=role,
+        client_session_keep_alive=True,
+    )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def query_dataframe(_connection: Any, sql: str) -> pd.DataFrame:
+    cursor = _connection.cursor()
+    try:
+        cursor.execute(sql)
+        columns = [column[0] for column in cursor.description]
+        return pd.DataFrame(cursor.fetchall(), columns=columns)
+    finally:
+        cursor.close()
+
+
+def vulnerability_band(value: Any) -> str:
+    if pd.isna(value):
+        return "Unknown"
+    value = float(value)
+    if value < 2.5:
+        return "Extremely low (<2.5%)"
+    if value < 5:
+        return "Very low (2.5% to <5%)"
+    if value < 20:
+        return "Moderately low (5% to <20%)"
+    if value < 35:
+        return "Moderately high (20% to <35%)"
+    return "Very high (35%+)"
+
+
+def percent(value: Any, digits: int = 1) -> str:
+    if value is None or pd.isna(value):
+        return "No data"
+    return f"{float(value):.{digits}f}%"
+
+
+def fmt_number(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return "No data"
+    return f"{float(value):,.0f}"
+
+
+def apply_filters(events: pd.DataFrame) -> pd.DataFrame:
+    filtered = events.copy()
+    selected_years = st.sidebar.slider(
+        "Event years",
+        int(events["EVENT_YEAR"].min()),
+        int(events["EVENT_YEAR"].max()),
+        (int(events["EVENT_YEAR"].min()), int(events["EVENT_YEAR"].max())),
+    )
+    selected_hazards = st.sidebar.multiselect(
+        "Hazards",
+        list(HAZARDS),
+        default=list(HAZARDS),
+    )
+    vulnerability_options = list(events["POU_CATEGORY"].drop_duplicates())
+    selected_vulnerability = st.sidebar.multiselect(
+        "Undernourishment category",
+        vulnerability_options,
+        default=vulnerability_options,
+    )
+    full_follow_up = st.sidebar.checkbox("Full 3-year follow-up only", value=False)
+
+    filtered = filtered[filtered["EVENT_YEAR"].between(*selected_years)]
+    filtered = filtered[filtered["POU_CATEGORY"].isin(selected_vulnerability)]
+    if selected_hazards:
+        hazard_mask = np.zeros(len(filtered), dtype=bool)
+        for hazard in selected_hazards:
+            hazard_mask |= filtered[HAZARDS[hazard]].fillna(0).astype(float).gt(0).to_numpy()
+        filtered = filtered[hazard_mask]
+    else:
+        filtered = filtered.iloc[0:0]
+    if full_follow_up:
+        filtered = filtered[filtered["HAS_FULL_3_YEAR_FOLLOWUP"].fillna(False)]
+    return filtered
+
+
+def overview_tab(events: pd.DataFrame, hazards: pd.DataFrame) -> None:
+    st.subheader("Global overview")
+    st.markdown(
+        '<div class="callout"><b>Question:</b> Where were climate events followed by '
+        "food-production declines, and which food-vulnerable countries had the most difficulty recovering?</div>",
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Country disaster-years", f"{len(events):,}")
+    c2.metric("Countries", f"{events['ISO3'].nunique():,}")
+    decline_count = int(events["WORST_CHANGE_PERCENT_T_TO_T1"].lt(0).sum())
+    c3.metric("Cases with a decline", f"{decline_count:,}")
+    full = events[events["HAS_FULL_3_YEAR_FOLLOWUP"].fillna(False)]
+    non_recovered = int(full["RECOVERY_STATUS"].eq("NOT_RECOVERED_WITHIN_3_YEARS").sum())
+    c4.metric("No recovery in 3 years", f"{non_recovered:,}")
+
+    left, right = st.columns((1.2, 1))
+    with left:
+        country_summary = (
+            events.groupby(["ISO3", "COUNTRY"], as_index=False)
+            .agg(
+                MEDIAN_WORST_CHANGE=("WORST_CHANGE_PERCENT_T_TO_T1", "median"),
+                EVENT_YEARS=("EVENT_YEAR", "nunique"),
+                POU=("UNDERNOURISHMENT_PERCENT", "median"),
+            )
+        )
+        fig = px.choropleth(
+            country_summary,
+            locations="ISO3",
+            color="MEDIAN_WORST_CHANGE",
+            hover_name="COUNTRY",
+            hover_data={"EVENT_YEARS": True, "POU": ":.1f", "ISO3": False},
+            color_continuous_scale=[COLORS["red"], "#F5E6E8", COLORS["green"]],
+            color_continuous_midpoint=0,
+            labels={
+                "MEDIAN_WORST_CHANGE": "Median worst change (%)",
+                "EVENT_YEARS": "Disaster-years",
+                "POU": "Undernourishment (%)",
+            },
+            title="Median production change following focus events",
+        )
+        fig.update_layout(margin=dict(l=0, r=0, t=45, b=0), paper_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with right:
+        hazard_counts = (
+            hazards[hazards["ISO3"].isin(events["ISO3"].unique())]
+            .groupby("DISASTER_TYPE", as_index=False)
+            .size()
+            .rename(columns={"size": "EVENT_COUNT"})
+            .sort_values("EVENT_COUNT")
+        )
+        fig = px.bar(
+            hazard_counts,
+            x="EVENT_COUNT",
+            y="DISASTER_TYPE",
+            orientation="h",
+            text="EVENT_COUNT",
+            title="Recorded disasters by type",
+            color_discrete_sequence=[COLORS["rose"]],
+            labels={"EVENT_COUNT": "Events", "DISASTER_TYPE": ""},
+        )
+        fig.update_traces(textposition="outside")
+        fig.update_layout(
+            showlegend=False,
+            margin=dict(l=0, r=30, t=45, b=0),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            xaxis_showgrid=False,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    left, right = st.columns(2)
+    with left:
+        recovery = (
+            events[events["HAS_FULL_3_YEAR_FOLLOWUP"].fillna(False)]
+            .groupby("RECOVERY_STATUS", as_index=False)
+            .size()
+            .rename(columns={"size": "CASES"})
+        )
+        status_order = ["MAINTAINED", "RECOVERED", "NOT_RECOVERED_WITHIN_3_YEARS"]
+        recovery["RECOVERY_STATUS"] = pd.Categorical(
+            recovery["RECOVERY_STATUS"], categories=status_order, ordered=True
+        )
+        recovery = recovery.sort_values("RECOVERY_STATUS")
+        fig = px.bar(
+            recovery,
+            x="RECOVERY_STATUS",
+            y="CASES",
+            text="CASES",
+            title="Recovery outcomes with complete follow-up",
+            color="RECOVERY_STATUS",
+            color_discrete_map={
+                "MAINTAINED": COLORS["green"],
+                "RECOVERED": COLORS["gold"],
+                "NOT_RECOVERED_WITHIN_3_YEARS": COLORS["red"],
+            },
+            labels={"RECOVERY_STATUS": "", "CASES": "Country disaster-years"},
+        )
+        fig.update_layout(showlegend=False, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with right:
+        scatter = events.dropna(subset=["UNDERNOURISHMENT_PERCENT", "WORST_CHANGE_PERCENT_T_TO_T1"])
+        fig = px.scatter(
+            scatter,
+            x="UNDERNOURISHMENT_PERCENT",
+            y="WORST_CHANGE_PERCENT_T_TO_T1",
+            color="RECOVERY_STATUS",
+            hover_name="COUNTRY",
+            hover_data=["EVENT_YEAR", "EVENT_TYPES"],
+            opacity=0.65,
+            title="Undernourishment and production change",
+            labels={
+                "UNDERNOURISHMENT_PERCENT": "Undernourishment (%)",
+                "WORST_CHANGE_PERCENT_T_TO_T1": "Worst production change, T to T+1 (%)",
+                "RECOVERY_STATUS": "Outcome",
+            },
+            color_discrete_map={
+                "MAINTAINED": COLORS["green"],
+                "RECOVERED": COLORS["gold"],
+                "NOT_RECOVERED_WITHIN_3_YEARS": COLORS["red"],
+                "FOLLOW_UP_INCOMPLETE": COLORS["gray"],
+            },
+        )
+        fig.add_hline(y=0, line_dash="dot", line_color=COLORS["gray"])
+        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def country_tab(events: pd.DataFrame, production: pd.DataFrame) -> None:
+    st.subheader("Country deep dive")
+    countries = sorted(events["COUNTRY"].dropna().unique())
+    country = st.selectbox("Choose a country", countries)
+    country_events = events[events["COUNTRY"].eq(country)].sort_values("EVENT_YEAR")
+    event_year = st.selectbox("Choose an event year", country_events["EVENT_YEAR"].astype(int).tolist())
+    row = country_events[country_events["EVENT_YEAR"].eq(event_year)].iloc[0]
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Event types", row["EVENT_TYPES"])
+    c2.metric("Worst production change", percent(row["WORST_CHANGE_PERCENT_T_TO_T1"]))
+    c3.metric("Recovery status", str(row["RECOVERY_STATUS"]).replace("_", " ").title())
+    c4.metric("Undernourishment", percent(row["UNDERNOURISHMENT_PERCENT"]))
+
+    series = production[
+        production["AREA_CODE_M49"].astype(str).eq(str(row["AREA_CODE_M49"]))
+        & production["YEAR"].between(int(event_year) - 4, int(event_year) + 4)
+    ].copy()
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=series["YEAR"],
+            y=series["FOOD_PRODUCTION_INDEX"],
+            mode="lines+markers",
+            name="Food-production index",
+            line=dict(color=COLORS["plum"], width=3),
+        )
+    )
+    fig.add_hline(
+        y=float(row["BASELINE_INDEX"]),
+        line_dash="dash",
+        line_color=COLORS["gray"],
+        annotation_text="Pre-event baseline",
+    )
+    fig.add_hline(
+        y=float(row["BASELINE_INDEX"]) * 0.95,
+        line_dash="dot",
+        line_color=COLORS["gold"],
+        annotation_text="95% recovery threshold",
+    )
+    fig.add_vline(
+        x=int(event_year),
+        line_dash="dash",
+        line_color=COLORS["red"],
+        annotation_text="Event year",
+    )
+    fig.update_layout(
+        title=f"{country}: production before and after {event_year}",
+        xaxis_title="Year",
+        yaxis_title="Food-production index (2014–2016 = 100)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="white",
+        margin=dict(t=60),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    details = pd.DataFrame(
+        {
+            "Measure": [
+                "Country disaster-year",
+                "Pre-event baseline",
+                "Event-year index",
+                "Worst index in T to T+1",
+                "Recovery time",
+                "People affected, reported",
+                "Deaths, reported",
+                "Adjusted damage (000 USD)",
+            ],
+            "Value": [
+                f"{country}, {int(event_year)}",
+                f"{float(row['BASELINE_INDEX']):.1f}",
+                f"{float(row['EVENT_YEAR_INDEX']):.1f}",
+                f"{float(row['WORST_INDEX_T_TO_T1']):.1f}" if pd.notna(row["WORST_INDEX_T_TO_T1"]) else "No data",
+                f"{int(row['RECOVERY_YEARS'])} years" if pd.notna(row["RECOVERY_YEARS"]) else "Not observed",
+                fmt_number(row["TOTAL_AFFECTED_REPORTED"]),
+                fmt_number(row["TOTAL_DEATHS_REPORTED"]),
+                fmt_number(row["TOTAL_DAMAGE_ADJUSTED_000_USD"]),
+            ],
+        }
+    )
+    st.dataframe(details, hide_index=True, use_container_width=True)
+
+
+def assumptions_tab(events: pd.DataFrame) -> None:
+    st.subheader("Assumptions Lab")
+    st.caption("These settings are project-defined. Adjust them to see whether the main conclusion changes.")
+    threshold = st.slider("Recovery threshold", 90, 100, 95, 1)
+    window = st.slider("Recovery window (years)", 1, 3, 3, 1)
+    include_bounds = st.checkbox("Include upper-bound undernourishment estimates", value=True)
+
+    data = events.copy()
+    cutoff = data["BASELINE_INDEX"] * threshold / 100
+    available_years = [data[f"YEAR_{year}_INDEX"] for year in range(1, window + 1)]
+    maintained = data["EVENT_YEAR_INDEX"].ge(cutoff)
+    recovered = pd.Series(False, index=data.index)
+    recovery_year = pd.Series(np.nan, index=data.index)
+    for year, values in enumerate(available_years, start=1):
+        newly_recovered = (~maintained) & (~recovered) & values.ge(cutoff)
+        recovery_year.loc[newly_recovered] = year
+        recovered |= newly_recovered
+
+    full_window = data["EVENT_YEAR"].le(data["MAX_PRODUCTION_YEAR"] - window)
+    data["LAB_STATUS"] = np.select(
+        [maintained, recovered, full_window],
+        ["Maintained", "Recovered", f"Not recovered within {window} years"],
+        default="Follow-up incomplete",
+    )
+    data["LAB_RECOVERY_YEARS"] = recovery_year
+    if not include_bounds:
+        data = data[~data["UNDERNOURISHMENT_IS_UPPER_BOUND"].fillna(False)]
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Maintained", f"{data['LAB_STATUS'].eq('Maintained').sum():,}")
+    c2.metric("Recovered", f"{data['LAB_STATUS'].eq('Recovered').sum():,}")
+    c3.metric(
+        f"No recovery in {window} years",
+        f"{data['LAB_STATUS'].eq(f'Not recovered within {window} years').sum():,}",
+    )
+
+    counts = data.groupby("LAB_STATUS", as_index=False).size().rename(columns={"size": "CASES"})
+    fig = px.bar(
+        counts,
+        x="LAB_STATUS",
+        y="CASES",
+        text="CASES",
+        color="LAB_STATUS",
+        color_discrete_sequence=[COLORS["green"], COLORS["gold"], COLORS["red"], COLORS["gray"]],
+        labels={"LAB_STATUS": "", "CASES": "Country disaster-years"},
+        title=f"Outcomes using a {threshold}% threshold and {window}-year window",
+    )
+    fig.update_layout(showlegend=False, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.info(
+        "Current limitation: the maintained classification begins with event-year production. "
+        "The separate T to T+1 metric should be reviewed for delayed impacts before final conclusions."
+    )
+
+
+def methodology_tab() -> None:
+    st.subheader("Methodology and limitations")
+    st.markdown(
+        """
+        **Analysis unit:** one country experiencing one or more focus events during one year.
+
+        **Focus events:** drought, wildfire, extreme temperature, flood, and storm.
+
+        **Production baseline:** the average food-production index during the three years before an event,
+        with at least two years required.
+
+        **Recovery:** a project-defined rule. The working definition is a return to at least 95% of baseline
+        within three years. It is not an agency standard.
+
+        **Food vulnerability:** prevalence of undernourishment is the primary measure. Survey-based food
+        insecurity is retained as a separate secondary measure because the methodologies are different.
+
+        **Interpretation:** the results show associations and recovery patterns. They do not prove that a
+        recorded disaster caused the observed production change.
+        """
+    )
+
+
+st.title("After the Shock")
+st.markdown("### Food System Resilience Explorer")
+st.write(
+    "Explore how national food production changed during and after climate-related events, "
+    "and whether countries already facing undernourishment had greater difficulty recovering."
+)
+
+stored_password = secret_value("password", os.getenv("SNOWFLAKE_PASSWORD", ""))
+cloud_connection = bool(stored_password)
+
+with st.sidebar:
+    if cloud_connection:
+        account = secret_value("account", "biofiay-oi65812")
+        user = secret_value("user", "")
+        password = stored_password
+        warehouse = secret_value("warehouse", "FAOSTAT_WH")
+        database = secret_value("database", "FAOSTAT_DB")
+        role = secret_value("role", "DATATHON_APP_ROLE")
+        connect_clicked = False
+        st.success("Secure Snowflake connection configured")
+        st.caption("Credentials are stored server-side and are not visible to app visitors.")
+    else:
+        st.header("Snowflake connection")
+        account = st.text_input("Account", value="biofiay-oi65812")
+        user = st.text_input("Username", value="jrapson")
+        password = st.text_input("Password", value="", type="password")
+        warehouse = st.text_input("Warehouse", value="FAOSTAT_WH")
+        database = st.text_input("Database", value="FAOSTAT_DB")
+        role = st.text_input("Role", value="ACCOUNTADMIN")
+        connect_clicked = st.button("Connect", type="primary", use_container_width=True)
+        st.caption("The password is used for this session and is not written to the project files.")
+
+if cloud_connection or connect_clicked:
+    st.session_state["connect_requested"] = True
+
+if not st.session_state.get("connect_requested"):
+    st.info("Enter your Snowflake password in the sidebar and select **Connect** to load the dashboard.")
+    st.stop()
+
+if not password:
+    st.error("Enter a Snowflake password to connect.")
+    st.stop()
+
+try:
+    with st.spinner("Loading analysis data from Snowflake..."):
+        connection = connect_snowflake(account, user, password, warehouse, database, role)
+        events_df = query_dataframe(connection, EVENT_SQL)
+        production_df = query_dataframe(connection, PRODUCTION_SQL)
+        hazards_df = query_dataframe(connection, HAZARD_SQL)
+except Exception as exc:
+    st.error("Snowflake connection failed. Check the account, username, password, warehouse, and role.")
+    with st.expander("Technical details"):
+        st.code(str(exc))
+    st.stop()
+
+numeric_columns = [
+    "EVENT_YEAR", "TOTAL_FOCUS_EVENTS", "DROUGHT_EVENTS", "WILDFIRE_EVENTS",
+    "EXTREME_TEMPERATURE_EVENTS", "FLOOD_EVENTS", "STORM_EVENTS",
+    "BASELINE_YEAR_COUNT", "BASELINE_INDEX", "EVENT_YEAR_INDEX", "YEAR_1_INDEX",
+    "YEAR_2_INDEX", "YEAR_3_INDEX", "WORST_INDEX_T_TO_T1", "MAX_PRODUCTION_YEAR",
+    "EVENT_YEAR_CHANGE_PERCENT", "WORST_CHANGE_PERCENT_T_TO_T1", "RECOVERY_YEARS",
+    "UNDERNOURISHMENT_PERCENT", "FOOD_INSECURITY_PERCENT", "TOTAL_AFFECTED_REPORTED",
+    "TOTAL_DEATHS_REPORTED", "TOTAL_DAMAGE_ADJUSTED_000_USD",
+]
+for column in numeric_columns:
+    events_df[column] = pd.to_numeric(events_df[column], errors="coerce")
+production_df["YEAR"] = pd.to_numeric(production_df["YEAR"], errors="coerce")
+production_df["FOOD_PRODUCTION_INDEX"] = pd.to_numeric(
+    production_df["FOOD_PRODUCTION_INDEX"], errors="coerce"
+)
+hazards_df["START_YEAR"] = pd.to_numeric(hazards_df["START_YEAR"], errors="coerce")
+events_df["POU_CATEGORY"] = events_df["UNDERNOURISHMENT_PERCENT"].apply(vulnerability_band)
+
+st.sidebar.divider()
+st.sidebar.header("Dashboard filters")
+filtered_events = apply_filters(events_df)
+filtered_hazards = hazards_df[
+    hazards_df["START_YEAR"].between(
+        filtered_events["EVENT_YEAR"].min() if not filtered_events.empty else 0,
+        filtered_events["EVENT_YEAR"].max() if not filtered_events.empty else 0,
+    )
+]
+
+if filtered_events.empty:
+    st.warning("No cases match the current filters.")
+    st.stop()
+
+overview, country, assumptions, methods = st.tabs(
+    ["Global overview", "Country deep dive", "Assumptions Lab", "Methodology"]
+)
+with overview:
+    overview_tab(filtered_events, filtered_hazards)
+with country:
+    country_tab(filtered_events, production_df)
+with assumptions:
+    assumptions_tab(filtered_events)
+with methods:
+    methodology_tab()
