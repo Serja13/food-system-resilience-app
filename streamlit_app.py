@@ -167,22 +167,30 @@ def friendly_status(value: Any) -> str:
     return str(value).replace("_", " ").title()
 
 
+def select_country_focus_event(
+    events: pd.DataFrame,
+    iso3: str,
+    shock_column: str,
+) -> Any:
+    country_events = events[events["ISO3"].eq(iso3)].copy()
+    if country_events.empty:
+        return None
+    measured_events = country_events.dropna(subset=[shock_column])
+    if measured_events.empty:
+        return country_events.sort_values("EVENT_YEAR").iloc[-1]
+    # The lowest value is the deepest production drop versus the selected benchmark.
+    return measured_events.loc[measured_events[shock_column].idxmin()]
+
+
 def render_country_snapshot(
     events: pd.DataFrame,
     iso3: str,
     shock_column: str,
     shock_label: str,
 ) -> None:
-    country_events = events[events["ISO3"].eq(iso3)].copy()
-    if country_events.empty:
+    row = select_country_focus_event(events, iso3, shock_column)
+    if row is None:
         return
-
-    measured_events = country_events.dropna(subset=[shock_column])
-    if measured_events.empty:
-        row = country_events.sort_values("EVENT_YEAR").iloc[-1]
-    else:
-        # The lowest value is the deepest production drop versus the selected benchmark.
-        row = measured_events.loc[measured_events[shock_column].idxmin()]
 
     country = str(row["COUNTRY"])
     event_year = int(row["EVENT_YEAR"])
@@ -229,8 +237,98 @@ def render_country_snapshot(
     )
 
 
+def render_production_timeline(
+    row: Any,
+    production: pd.DataFrame,
+    chart_key: str,
+) -> None:
+    event_year = int(row["EVENT_YEAR"])
+    series = production[
+        production["AREA_CODE_M49"].astype(str).eq(str(row["AREA_CODE_M49"]))
+        & production["YEAR"].between(event_year - 5, event_year + 3)
+    ].copy()
+    series = series.sort_values("YEAR")
+    if series.empty:
+        st.info("No annual production series is available for this selected case.")
+        return
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=series["YEAR"],
+            y=series["FOOD_PRODUCTION_INDEX"],
+            mode="lines+markers",
+            name="Actual production",
+            line=dict(color=COLORS["plum"], width=3),
+            marker=dict(size=8),
+        )
+    )
+
+    has_trend = (
+        pd.notna(row["PRE_EVENT_TREND_SLOPE"])
+        and pd.notna(row["PRE_EVENT_TREND_INTERCEPT"])
+        and pd.notna(row["TREND_YEAR_COUNT"])
+        and float(row["TREND_YEAR_COUNT"]) >= 4
+    )
+    if has_trend:
+        series["EXPECTED_PRODUCTION"] = (
+            float(row["PRE_EVENT_TREND_INTERCEPT"])
+            + float(row["PRE_EVENT_TREND_SLOPE"]) * series["YEAR"]
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=series["YEAR"],
+                y=series["EXPECTED_PRODUCTION"],
+                mode="lines",
+                name="Expected from pre-event trend",
+                line=dict(color=COLORS["gold"], width=3, dash="dash"),
+            )
+        )
+
+    if pd.notna(row["BASELINE_INDEX"]):
+        fig.add_hline(
+            y=float(row["BASELINE_INDEX"]) * 0.95,
+            line_dash="dot",
+            line_color=COLORS["gray"],
+            annotation_text="95% recovery threshold",
+            annotation_position="bottom right",
+        )
+    fig.add_vrect(
+        x0=event_year,
+        x1=event_year + 3,
+        fillcolor=COLORS["rose"],
+        opacity=0.10,
+        line_width=0,
+        annotation_text="Event and recovery window",
+        annotation_position="top left",
+    )
+    fig.add_vline(x=event_year, line_dash="dash", line_color=COLORS["red"])
+    fig.update_layout(
+        title=f"Actual production versus expected path: {row['COUNTRY']}, {event_year}",
+        xaxis_title="Year",
+        yaxis_title="Food-production index (2014–2016 = 100)",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="white",
+        margin=dict(t=95),
+    )
+    st.plotly_chart(fig, use_container_width=True, key=chart_key)
+    if has_trend:
+        st.caption(
+            "The expected path extends the five-year pre-event trend. The shaded area is the "
+            "project's three-year recovery window; association does not by itself prove causation."
+        )
+    else:
+        st.caption(
+            "The expected trend is unavailable because fewer than four usable pre-event observations "
+            "were available. The actual production series and recovery threshold are still shown."
+        )
+
+
 def render_priority_explorer(
     events: pd.DataFrame,
+    production: pd.DataFrame,
     shock_column: str,
     shock_label: str,
 ) -> None:
@@ -312,6 +410,11 @@ def render_priority_explorer(
         f"comparison level during or immediately after {str(row['EVENT_TYPES']).lower()} in "
         f"{event_year}, and it had not returned to the project's recovery threshold within three years."
     )
+    render_production_timeline(
+        row,
+        production,
+        chart_key=f"priority_timeline_{row['ISO3']}_{event_year}",
+    )
 
 
 def apply_filters(events: pd.DataFrame) -> pd.DataFrame:
@@ -352,6 +455,7 @@ def apply_filters(events: pd.DataFrame) -> pd.DataFrame:
 def overview_tab(
     events: pd.DataFrame,
     hazards: pd.DataFrame,
+    production: pd.DataFrame,
     shock_column: str,
     shock_label: str,
 ) -> None:
@@ -422,11 +526,18 @@ def overview_tab(
     valid_iso3 = set(events["ISO3"].dropna().astype(str))
     if selected_iso3 in valid_iso3:
         render_country_snapshot(events, selected_iso3, shock_column, shock_label)
+        selected_row = select_country_focus_event(events, selected_iso3, shock_column)
+        if selected_row is not None:
+            render_production_timeline(
+                selected_row,
+                production,
+                chart_key=f"map_timeline_{selected_iso3}_{int(selected_row['EVENT_YEAR'])}",
+            )
     else:
         st.info("Select a country on the map to open its country snapshot here.")
 
     st.divider()
-    render_priority_explorer(events, shock_column, shock_label)
+    render_priority_explorer(events, production, shock_column, shock_label)
 
     st.divider()
     st.markdown("### Supporting context")
@@ -534,47 +645,11 @@ def country_tab(
     c3.metric("Recovery status", str(row["RECOVERY_STATUS"]).replace("_", " ").title())
     c4.metric("Undernourishment", percent(row["UNDERNOURISHMENT_PERCENT"]))
 
-    series = production[
-        production["AREA_CODE_M49"].astype(str).eq(str(row["AREA_CODE_M49"]))
-        & production["YEAR"].between(int(event_year) - 4, int(event_year) + 4)
-    ].copy()
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=series["YEAR"],
-            y=series["FOOD_PRODUCTION_INDEX"],
-            mode="lines+markers",
-            name="Food-production index",
-            line=dict(color=COLORS["plum"], width=3),
-        )
+    render_production_timeline(
+        row,
+        production,
+        chart_key=f"deep_dive_timeline_{row['ISO3']}_{int(event_year)}",
     )
-    fig.add_hline(
-        y=float(row["BASELINE_INDEX"]),
-        line_dash="dash",
-        line_color=COLORS["gray"],
-        annotation_text="Pre-event baseline",
-    )
-    fig.add_hline(
-        y=float(row["BASELINE_INDEX"]) * 0.95,
-        line_dash="dot",
-        line_color=COLORS["gold"],
-        annotation_text="95% recovery threshold",
-    )
-    fig.add_vline(
-        x=int(event_year),
-        line_dash="dash",
-        line_color=COLORS["red"],
-        annotation_text="Event year",
-    )
-    fig.update_layout(
-        title=f"{country}: production before and after {event_year}",
-        xaxis_title="Year",
-        yaxis_title="Food-production index (2014–2016 = 100)",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="white",
-        margin=dict(t=60),
-    )
-    st.plotly_chart(fig, use_container_width=True)
 
     details = pd.DataFrame(
         {
@@ -798,7 +873,7 @@ overview, country, assumptions, methods = st.tabs(
     ["Global overview", "Country deep dive", "Assumptions Lab", "Methodology"]
 )
 with overview:
-    overview_tab(filtered_events, filtered_hazards, shock_column, shock_label)
+    overview_tab(filtered_events, filtered_hazards, production_df, shock_column, shock_label)
 with country:
     country_tab(filtered_events, production_df, shock_column, shock_label)
 with assumptions:
