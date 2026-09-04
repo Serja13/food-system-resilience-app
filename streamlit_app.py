@@ -57,9 +57,13 @@ SELECT
     EXTREME_TEMPERATURE_EVENTS, FLOOD_EVENTS, STORM_EVENTS,
     TOTAL_AFFECTED_REPORTED, TOTAL_DEATHS_REPORTED,
     TOTAL_DAMAGE_ADJUSTED_000_USD, BASELINE_YEAR_COUNT, BASELINE_INDEX,
+    TREND_YEAR_COUNT, PRE_EVENT_TREND_SLOPE, PRE_EVENT_TREND_INTERCEPT,
+    EXPECTED_EVENT_YEAR_INDEX, EXPECTED_YEAR_1_INDEX,
     EVENT_YEAR_INDEX, YEAR_1_INDEX, YEAR_2_INDEX, YEAR_3_INDEX,
     WORST_INDEX_T_TO_T1, MAX_PRODUCTION_YEAR, EVENT_YEAR_CHANGE_PERCENT,
-    WORST_CHANGE_PERCENT_T_TO_T1, HAS_FULL_3_YEAR_FOLLOWUP,
+    WORST_CHANGE_PERCENT_T_TO_T1, EVENT_YEAR_DETRENDED_CHANGE_PERCENT,
+    YEAR_1_DETRENDED_CHANGE_PERCENT, WORST_DETRENDED_CHANGE_PERCENT_T_TO_T1,
+    HAS_FULL_3_YEAR_FOLLOWUP,
     RECOVERY_YEARS, RECOVERY_STATUS, RESILIENCE_CATEGORY,
     FOOD_INSECURITY_PERCENT, UNDERNOURISHMENT_PERCENT,
     FOOD_INSECURITY_IS_UPPER_BOUND, UNDERNOURISHMENT_IS_UPPER_BOUND
@@ -192,7 +196,12 @@ def apply_filters(events: pd.DataFrame) -> pd.DataFrame:
     return filtered
 
 
-def overview_tab(events: pd.DataFrame, hazards: pd.DataFrame) -> None:
+def overview_tab(
+    events: pd.DataFrame,
+    hazards: pd.DataFrame,
+    shock_column: str,
+    shock_label: str,
+) -> None:
     st.subheader("Global overview")
     st.markdown(
         '<div class="callout"><b>Question:</b> Where were climate events followed by '
@@ -203,7 +212,7 @@ def overview_tab(events: pd.DataFrame, hazards: pd.DataFrame) -> None:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Country disaster-years", f"{len(events):,}")
     c2.metric("Countries", f"{events['ISO3'].nunique():,}")
-    decline_count = int(events["WORST_CHANGE_PERCENT_T_TO_T1"].lt(0).sum())
+    decline_count = int(events[shock_column].lt(0).sum())
     c3.metric("Cases with a decline", f"{decline_count:,}")
     full = events[events["HAS_FULL_3_YEAR_FOLLOWUP"].fillna(False)]
     non_recovered = int(full["RECOVERY_STATUS"].eq("NOT_RECOVERED_WITHIN_3_YEARS").sum())
@@ -214,7 +223,7 @@ def overview_tab(events: pd.DataFrame, hazards: pd.DataFrame) -> None:
         country_summary = (
             events.groupby(["ISO3", "COUNTRY"], as_index=False)
             .agg(
-                MEDIAN_WORST_CHANGE=("WORST_CHANGE_PERCENT_T_TO_T1", "median"),
+                MEDIAN_SHOCK=(shock_column, "median"),
                 EVENT_YEARS=("EVENT_YEAR", "nunique"),
                 POU=("UNDERNOURISHMENT_PERCENT", "median"),
             )
@@ -222,17 +231,17 @@ def overview_tab(events: pd.DataFrame, hazards: pd.DataFrame) -> None:
         fig = px.choropleth(
             country_summary,
             locations="ISO3",
-            color="MEDIAN_WORST_CHANGE",
+            color="MEDIAN_SHOCK",
             hover_name="COUNTRY",
             hover_data={"EVENT_YEARS": True, "POU": ":.1f", "ISO3": False},
             color_continuous_scale=[COLORS["red"], "#F5E6E8", COLORS["green"]],
             color_continuous_midpoint=0,
             labels={
-                "MEDIAN_WORST_CHANGE": "Median worst change (%)",
+                "MEDIAN_SHOCK": f"Median {shock_label.lower()} (%)",
                 "EVENT_YEARS": "Disaster-years",
                 "POU": "Undernourishment (%)",
             },
-            title="Median production change following focus events",
+            title=f"Median {shock_label.lower()} following focus events",
         )
         fig.update_layout(margin=dict(l=0, r=0, t=45, b=0), paper_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig, use_container_width=True)
@@ -296,11 +305,11 @@ def overview_tab(events: pd.DataFrame, hazards: pd.DataFrame) -> None:
         st.plotly_chart(fig, use_container_width=True)
 
     with right:
-        scatter = events.dropna(subset=["UNDERNOURISHMENT_PERCENT", "WORST_CHANGE_PERCENT_T_TO_T1"])
+        scatter = events.dropna(subset=["UNDERNOURISHMENT_PERCENT", shock_column])
         fig = px.scatter(
             scatter,
             x="UNDERNOURISHMENT_PERCENT",
-            y="WORST_CHANGE_PERCENT_T_TO_T1",
+            y=shock_column,
             color="RECOVERY_STATUS",
             hover_name="COUNTRY",
             hover_data=["EVENT_YEAR", "EVENT_TYPES"],
@@ -308,7 +317,7 @@ def overview_tab(events: pd.DataFrame, hazards: pd.DataFrame) -> None:
             title="Undernourishment and production change",
             labels={
                 "UNDERNOURISHMENT_PERCENT": "Undernourishment (%)",
-                "WORST_CHANGE_PERCENT_T_TO_T1": "Worst production change, T to T+1 (%)",
+                shock_column: f"{shock_label} (%)",
                 "RECOVERY_STATUS": "Outcome",
             },
             color_discrete_map={
@@ -323,7 +332,12 @@ def overview_tab(events: pd.DataFrame, hazards: pd.DataFrame) -> None:
         st.plotly_chart(fig, use_container_width=True)
 
 
-def country_tab(events: pd.DataFrame, production: pd.DataFrame) -> None:
+def country_tab(
+    events: pd.DataFrame,
+    production: pd.DataFrame,
+    shock_column: str,
+    shock_label: str,
+) -> None:
     st.subheader("Country deep dive")
     countries = sorted(events["COUNTRY"].dropna().unique())
     country = st.selectbox("Choose a country", countries)
@@ -333,7 +347,7 @@ def country_tab(events: pd.DataFrame, production: pd.DataFrame) -> None:
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Event types", row["EVENT_TYPES"])
-    c2.metric("Worst production change", percent(row["WORST_CHANGE_PERCENT_T_TO_T1"]))
+    c2.metric(shock_label, percent(row[shock_column]))
     c3.metric("Recovery status", str(row["RECOVERY_STATUS"]).replace("_", " ").title())
     c4.metric("Undernourishment", percent(row["UNDERNOURISHMENT_PERCENT"]))
 
@@ -386,6 +400,9 @@ def country_tab(events: pd.DataFrame, production: pd.DataFrame) -> None:
                 "Pre-event baseline",
                 "Event-year index",
                 "Worst index in T to T+1",
+                "Raw shock vs. 3-year baseline",
+                "Detrended shock vs. expected trend",
+                "Pre-event trend observations",
                 "Recovery time",
                 "People affected, reported",
                 "Deaths, reported",
@@ -396,6 +413,9 @@ def country_tab(events: pd.DataFrame, production: pd.DataFrame) -> None:
                 f"{float(row['BASELINE_INDEX']):.1f}",
                 f"{float(row['EVENT_YEAR_INDEX']):.1f}",
                 f"{float(row['WORST_INDEX_T_TO_T1']):.1f}" if pd.notna(row["WORST_INDEX_T_TO_T1"]) else "No data",
+                percent(row["WORST_CHANGE_PERCENT_T_TO_T1"]),
+                percent(row["WORST_DETRENDED_CHANGE_PERCENT_T_TO_T1"]),
+                f"{int(row['TREND_YEAR_COUNT'])} years" if pd.notna(row["TREND_YEAR_COUNT"]) else "No data",
                 f"{int(row['RECOVERY_YEARS'])} years" if pd.notna(row["RECOVERY_YEARS"]) else "Not observed",
                 fmt_number(row["TOTAL_AFFECTED_REPORTED"]),
                 fmt_number(row["TOTAL_DEATHS_REPORTED"]),
@@ -473,6 +493,10 @@ def methodology_tab() -> None:
         **Production baseline:** the average food-production index during the three years before an event,
         with at least two years required.
 
+        **Detrended shock:** a linear trend is fitted to the five pre-event years, with at least four
+        observations required. The metric is the worse percentage deviation from trend-predicted production
+        in the event year or following year. Negative values indicate production below its expected path.
+
         **Recovery:** a project-defined rule. The working definition is a return to at least 95% of baseline
         within three years. It is not an agency standard.
 
@@ -545,7 +569,11 @@ numeric_columns = [
     "EXTREME_TEMPERATURE_EVENTS", "FLOOD_EVENTS", "STORM_EVENTS",
     "BASELINE_YEAR_COUNT", "BASELINE_INDEX", "EVENT_YEAR_INDEX", "YEAR_1_INDEX",
     "YEAR_2_INDEX", "YEAR_3_INDEX", "WORST_INDEX_T_TO_T1", "MAX_PRODUCTION_YEAR",
-    "EVENT_YEAR_CHANGE_PERCENT", "WORST_CHANGE_PERCENT_T_TO_T1", "RECOVERY_YEARS",
+    "TREND_YEAR_COUNT", "PRE_EVENT_TREND_SLOPE", "PRE_EVENT_TREND_INTERCEPT",
+    "EXPECTED_EVENT_YEAR_INDEX", "EXPECTED_YEAR_1_INDEX", "EVENT_YEAR_CHANGE_PERCENT",
+    "WORST_CHANGE_PERCENT_T_TO_T1", "EVENT_YEAR_DETRENDED_CHANGE_PERCENT",
+    "YEAR_1_DETRENDED_CHANGE_PERCENT", "WORST_DETRENDED_CHANGE_PERCENT_T_TO_T1",
+    "RECOVERY_YEARS",
     "UNDERNOURISHMENT_PERCENT", "FOOD_INSECURITY_PERCENT", "TOTAL_AFFECTED_REPORTED",
     "TOTAL_DEATHS_REPORTED", "TOTAL_DAMAGE_ADJUSTED_000_USD",
 ]
@@ -561,6 +589,17 @@ events_df["POU_CATEGORY"] = events_df["UNDERNOURISHMENT_PERCENT"].apply(vulnerab
 st.sidebar.divider()
 st.sidebar.header("Dashboard filters")
 filtered_events = apply_filters(events_df)
+shock_choice = st.sidebar.radio(
+    "Shock measure",
+    ["Detrended (recommended)", "Raw 3-year baseline"],
+    help="Detrended compares actual production with the country's expected pre-event trend.",
+)
+if shock_choice == "Detrended (recommended)":
+    shock_column = "WORST_DETRENDED_CHANGE_PERCENT_T_TO_T1"
+    shock_label = "Detrended shock, T to T+1"
+else:
+    shock_column = "WORST_CHANGE_PERCENT_T_TO_T1"
+    shock_label = "Raw shock, T to T+1"
 filtered_hazards = hazards_df[
     hazards_df["START_YEAR"].between(
         filtered_events["EVENT_YEAR"].min() if not filtered_events.empty else 0,
@@ -576,9 +615,9 @@ overview, country, assumptions, methods = st.tabs(
     ["Global overview", "Country deep dive", "Assumptions Lab", "Methodology"]
 )
 with overview:
-    overview_tab(filtered_events, filtered_hazards)
+    overview_tab(filtered_events, filtered_hazards, shock_column, shock_label)
 with country:
-    country_tab(filtered_events, production_df)
+    country_tab(filtered_events, production_df, shock_column, shock_label)
 with assumptions:
     assumptions_tab(filtered_events)
 with methods:
