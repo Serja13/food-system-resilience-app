@@ -286,56 +286,64 @@ def overview_tab(
     non_recovered = int(full["RECOVERY_STATUS"].eq("NOT_RECOVERED_WITHIN_3_YEARS").sum())
     c4.metric("No recovery in 3 years", f"{non_recovered:,}")
 
-    left, right = st.columns((1.2, 1))
+    country_summary = (
+        events.groupby(["ISO3", "COUNTRY"], as_index=False)
+        .agg(
+            MEDIAN_SHOCK=(shock_column, "median"),
+            EVENT_YEARS=("EVENT_YEAR", "nunique"),
+            POU=("UNDERNOURISHMENT_PERCENT", "median"),
+        )
+    )
+    fig = px.choropleth(
+        country_summary,
+        locations="ISO3",
+        color="MEDIAN_SHOCK",
+        hover_name="COUNTRY",
+        custom_data=["ISO3"],
+        hover_data={"EVENT_YEARS": True, "POU": ":.1f", "ISO3": False},
+        color_continuous_scale=[COLORS["red"], "#F5E6E8", COLORS["green"]],
+        color_continuous_midpoint=0,
+        labels={
+            "MEDIAN_SHOCK": f"Median {shock_label.lower()} (%)",
+            "EVENT_YEARS": "Disaster-years",
+            "POU": "Undernourishment (%)",
+        },
+        title=f"Median {shock_label.lower()} following focus events",
+    )
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=45, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        clickmode="event+select",
+    )
+    st.caption("Click a country. Its snapshot will open immediately below the map.")
+    map_event = st.plotly_chart(
+        fig,
+        use_container_width=True,
+        key=f"overview_country_map_{shock_column}",
+        on_select="rerun",
+        selection_mode="points",
+    )
+
+    selected_points = map_event.selection.points
+    if selected_points:
+        point = selected_points[0]
+        selected_iso3 = point.get("location")
+        if not selected_iso3 and point.get("customdata"):
+            selected_iso3 = point["customdata"][0]
+        if selected_iso3:
+            st.session_state["overview_selected_iso3"] = selected_iso3
+
+    selected_iso3 = st.session_state.get("overview_selected_iso3")
+    valid_iso3 = set(events["ISO3"].dropna().astype(str))
+    if selected_iso3 in valid_iso3:
+        render_country_snapshot(events, selected_iso3, shock_column, shock_label)
+    else:
+        st.info("Select a country on the map to open its country snapshot here.")
+
+    st.divider()
+    st.markdown("### Supporting context")
+    left, right = st.columns(2)
     with left:
-        country_summary = (
-            events.groupby(["ISO3", "COUNTRY"], as_index=False)
-            .agg(
-                MEDIAN_SHOCK=(shock_column, "median"),
-                EVENT_YEARS=("EVENT_YEAR", "nunique"),
-                POU=("UNDERNOURISHMENT_PERCENT", "median"),
-            )
-        )
-        fig = px.choropleth(
-            country_summary,
-            locations="ISO3",
-            color="MEDIAN_SHOCK",
-            hover_name="COUNTRY",
-            custom_data=["ISO3"],
-            hover_data={"EVENT_YEARS": True, "POU": ":.1f", "ISO3": False},
-            color_continuous_scale=[COLORS["red"], "#F5E6E8", COLORS["green"]],
-            color_continuous_midpoint=0,
-            labels={
-                "MEDIAN_SHOCK": f"Median {shock_label.lower()} (%)",
-                "EVENT_YEARS": "Disaster-years",
-                "POU": "Undernourishment (%)",
-            },
-            title=f"Median {shock_label.lower()} following focus events",
-        )
-        fig.update_layout(
-            margin=dict(l=0, r=0, t=45, b=0),
-            paper_bgcolor="rgba(0,0,0,0)",
-            clickmode="event+select",
-        )
-        st.caption("Click a country to see its most severe production shock below the map.")
-        map_event = st.plotly_chart(
-            fig,
-            use_container_width=True,
-            key=f"overview_country_map_{shock_column}",
-            on_select="rerun",
-            selection_mode="points",
-        )
-
-        selected_points = map_event.selection.points
-        if selected_points:
-            point = selected_points[0]
-            selected_iso3 = point.get("location")
-            if not selected_iso3 and point.get("customdata"):
-                selected_iso3 = point["customdata"][0]
-            if selected_iso3:
-                st.session_state["overview_selected_iso3"] = selected_iso3
-
-    with right:
         hazard_counts = (
             hazards[hazards["ISO3"].isin(events["ISO3"].unique())]
             .groupby("DISASTER_TYPE", as_index=False)
@@ -363,15 +371,7 @@ def overview_tab(
         )
         st.plotly_chart(fig, use_container_width=True)
 
-    selected_iso3 = st.session_state.get("overview_selected_iso3")
-    valid_iso3 = set(events["ISO3"].dropna().astype(str))
-    if selected_iso3 in valid_iso3:
-        render_country_snapshot(events, selected_iso3, shock_column, shock_label)
-    else:
-        st.info("Select a country on the map to open its country snapshot.")
-
-    left, right = st.columns(2)
-    with left:
+    with right:
         recovery = (
             events[events["HAS_FULL_3_YEAR_FOLLOWUP"].fillna(False)]
             .groupby("RECOVERY_STATUS", as_index=False)
@@ -400,32 +400,31 @@ def overview_tab(
         fig.update_layout(showlegend=False, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig, use_container_width=True)
 
-    with right:
-        scatter = events.dropna(subset=["UNDERNOURISHMENT_PERCENT", shock_column])
-        fig = px.scatter(
-            scatter,
-            x="UNDERNOURISHMENT_PERCENT",
-            y=shock_column,
-            color="RECOVERY_STATUS",
-            hover_name="COUNTRY",
-            hover_data=["EVENT_YEAR", "EVENT_TYPES"],
-            opacity=0.65,
-            title="Undernourishment and production change",
-            labels={
-                "UNDERNOURISHMENT_PERCENT": "Undernourishment (%)",
-                shock_column: f"{shock_label} (%)",
-                "RECOVERY_STATUS": "Outcome",
-            },
-            color_discrete_map={
-                "MAINTAINED": COLORS["green"],
-                "RECOVERED": COLORS["gold"],
-                "NOT_RECOVERED_WITHIN_3_YEARS": COLORS["red"],
-                "FOLLOW_UP_INCOMPLETE": COLORS["gray"],
-            },
-        )
-        fig.add_hline(y=0, line_dash="dot", line_color=COLORS["gray"])
-        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig, use_container_width=True)
+    scatter = events.dropna(subset=["UNDERNOURISHMENT_PERCENT", shock_column])
+    fig = px.scatter(
+        scatter,
+        x="UNDERNOURISHMENT_PERCENT",
+        y=shock_column,
+        color="RECOVERY_STATUS",
+        hover_name="COUNTRY",
+        hover_data=["EVENT_YEAR", "EVENT_TYPES"],
+        opacity=0.65,
+        title="Undernourishment and production change",
+        labels={
+            "UNDERNOURISHMENT_PERCENT": "Undernourishment (%)",
+            shock_column: f"{shock_label} (%)",
+            "RECOVERY_STATUS": "Outcome",
+        },
+        color_discrete_map={
+            "MAINTAINED": COLORS["green"],
+            "RECOVERED": COLORS["gold"],
+            "NOT_RECOVERED_WITHIN_3_YEARS": COLORS["red"],
+            "FOLLOW_UP_INCOMPLETE": COLORS["gray"],
+        },
+    )
+    fig.add_hline(y=0, line_dash="dot", line_color=COLORS["gray"])
+    fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def country_tab(
