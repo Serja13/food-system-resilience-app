@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 import snowflake.connector
 import streamlit as st
 
@@ -132,6 +133,91 @@ def query_dataframe(_connection: Any, sql: str) -> pd.DataFrame:
         return pd.DataFrame(cursor.fetchall(), columns=columns)
     finally:
         cursor.close()
+
+
+def snowflake_base_url(account: str) -> str:
+    host = account.strip().replace("https://", "").replace("http://", "").rstrip("/")
+    if not host.endswith(".snowflakecomputing.com"):
+        host = f"{host}.snowflakecomputing.com"
+    return f"https://{host}"
+
+
+def collect_agent_artifacts(payload: dict[str, Any]) -> tuple[str, list[dict[str, Any]], list[str], list[str]]:
+    response_text = "\n\n".join(
+        item.get("text", "")
+        for item in payload.get("content", [])
+        if item.get("type") == "text" and item.get("text")
+    ).strip()
+    tables: list[dict[str, Any]] = []
+    sql_statements: list[str] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            result_set = value.get("result_set")
+            if isinstance(result_set, dict) and result_set.get("data") is not None:
+                metadata = result_set.get("resultSetMetaData", {})
+                columns = [column.get("name", "Column") for column in metadata.get("rowType", [])]
+                tables.append({"columns": columns, "rows": result_set.get("data", [])})
+            sql = value.get("sql")
+            if isinstance(sql, str) and sql.strip() and sql not in sql_statements:
+                sql_statements.append(sql)
+            for key, child in value.items():
+                if key != "result_set":
+                    walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(payload.get("content", []))
+    warning_messages = [
+        warning.get("message", "")
+        for warning in payload.get("warnings", [])
+        if warning.get("message")
+    ]
+    if not response_text:
+        response_text = "The agent completed the request but did not return a written summary."
+    return response_text, tables, sql_statements, warning_messages
+
+
+def run_resilience_agent(
+    account: str,
+    token: str,
+    conversation: list[dict[str, Any]],
+) -> dict[str, Any]:
+    endpoint = (
+        f"{snowflake_base_url(account)}/api/v2/databases/FAOSTAT_DB/schemas/ANALYTICS/"
+        "agents/FOOD_SYSTEM_RESILIENCE_AGENT:run"
+    )
+    api_messages = [
+        {
+            "role": message["role"],
+            "content": [{"type": "text", "text": message["text"]}],
+        }
+        for message in conversation[-8:]
+    ]
+    response = requests.post(
+        endpoint,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        json={
+            "messages": api_messages,
+            "background": False,
+            "stream": False,
+            "tool_choice": {"type": "auto"},
+        },
+        timeout=180,
+    )
+    if not response.ok:
+        try:
+            error_detail = response.json().get("message", response.text)
+        except ValueError:
+            error_detail = response.text
+        raise RuntimeError(f"Snowflake Agent request failed ({response.status_code}): {error_detail[:800]}")
+    return response.json()
 
 
 def vulnerability_band(value: Any) -> str:
@@ -802,6 +888,99 @@ def assumptions_tab(events: pd.DataFrame) -> None:
     )
 
 
+def ask_data_tab(account: str, token: str) -> None:
+    st.subheader("Ask the Data")
+    st.write(
+        "Ask questions in everyday language. The Snowflake agent uses the project's governed "
+        "definitions for production shock, recovery, food vulnerability, and priority cases."
+    )
+    st.caption(
+        "The assistant can summarize patterns in this dataset. Its answers show associations, not proof "
+        "that a recorded disaster caused a production change."
+    )
+
+    if not token:
+        st.info("Add the Snowflake programmatic access token to the app secrets to enable this tab.")
+        return
+
+    if "resilience_chat" not in st.session_state:
+        st.session_state["resilience_chat"] = []
+
+    header_left, header_right = st.columns([4, 1])
+    with header_right:
+        if st.button("Clear conversation", use_container_width=True):
+            st.session_state["resilience_chat"] = []
+            st.rerun()
+
+    for message in st.session_state["resilience_chat"]:
+        with st.chat_message(message["role"]):
+            st.markdown(message["text"])
+            for table in message.get("tables", []):
+                if table["columns"]:
+                    st.dataframe(
+                        pd.DataFrame(table["rows"], columns=table["columns"]),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+            if message.get("sql"):
+                with st.expander("SQL used by Snowflake"):
+                    for statement in message["sql"]:
+                        st.code(statement, language="sql")
+            for warning in message.get("warnings", []):
+                st.warning(warning)
+
+    suggested_questions = [
+        "Which countries meet all three priority rules?",
+        "Which drought cases had the largest detrended production drops?",
+        "How do recovery outcomes differ by disaster type?",
+    ]
+    selected_suggestion = None
+    if not st.session_state["resilience_chat"]:
+        st.markdown("**Try one of these:**")
+        suggestion_columns = st.columns(3)
+        for index, question in enumerate(suggested_questions):
+            with suggestion_columns[index]:
+                if st.button(question, key=f"suggested_question_{index}", use_container_width=True):
+                    selected_suggestion = question
+
+    typed_question = st.chat_input("Ask about countries, disasters, production shocks, or recovery")
+    question = typed_question or selected_suggestion
+    if not question:
+        return
+
+    st.session_state["resilience_chat"].append({"role": "user", "text": question})
+    with st.spinner("Snowflake is analyzing the resilience data..."):
+        try:
+            payload = run_resilience_agent(
+                account,
+                token,
+                st.session_state["resilience_chat"],
+            )
+            text, tables, sql_statements, warnings = collect_agent_artifacts(payload)
+            st.session_state["resilience_chat"].append(
+                {
+                    "role": "assistant",
+                    "text": text,
+                    "tables": tables,
+                    "sql": sql_statements,
+                    "warnings": warnings,
+                }
+            )
+        except Exception as exc:
+            st.session_state["resilience_chat"].append(
+                {
+                    "role": "assistant",
+                    "text": (
+                        "I could not reach the Snowflake resilience agent. Confirm that "
+                        "`18_create_resilience_semantic_agent.sql` completed successfully and that "
+                        "the app secret contains the current programmatic access token."
+                    ),
+                    "warnings": [str(exc)],
+                }
+            )
+    st.rerun()
+
+
 def methodology_tab() -> None:
     st.subheader("Methodology and limitations")
     st.markdown(
@@ -837,6 +1016,7 @@ st.write(
 )
 
 stored_password = secret_value("password", os.getenv("SNOWFLAKE_PASSWORD", ""))
+agent_token = secret_value("token", stored_password)
 cloud_connection = bool(stored_password)
 
 with st.sidebar:
@@ -931,13 +1111,15 @@ if filtered_events.empty:
     st.warning("No cases match the current filters.")
     st.stop()
 
-overview, country, assumptions, methods = st.tabs(
-    ["Global overview", "Country deep dive", "Assumptions Lab", "Methodology"]
+overview, country, ask_data, assumptions, methods = st.tabs(
+    ["Global overview", "Country deep dive", "Ask the Data", "Assumptions Lab", "Methodology"]
 )
 with overview:
     overview_tab(filtered_events, filtered_hazards, production_df, shock_column, shock_label)
 with country:
     country_tab(filtered_events, production_df, shock_column, shock_label)
+with ask_data:
+    ask_data_tab(account, agent_token)
 with assumptions:
     assumptions_tab(filtered_events)
 with methods:
