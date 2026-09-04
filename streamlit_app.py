@@ -229,6 +229,91 @@ def render_country_snapshot(
     )
 
 
+def render_priority_explorer(
+    events: pd.DataFrame,
+    shock_column: str,
+    shock_label: str,
+) -> None:
+    shock_threshold = -10
+    undernourishment_threshold = 20
+    priority = events[
+        events[shock_column].le(shock_threshold)
+        & events["UNDERNOURISHMENT_PERCENT"].ge(undernourishment_threshold)
+        & events["RECOVERY_STATUS"].eq("NOT_RECOVERED_WITHIN_3_YEARS")
+    ].copy()
+    priority = priority.sort_values(
+        [shock_column, "UNDERNOURISHMENT_PERCENT", "COUNTRY", "EVENT_YEAR"],
+        ascending=[True, False, True, True],
+    ).reset_index(drop=True)
+
+    st.markdown("### Priority Country Explorer")
+    st.write(
+        "These cases combine a major production shock, substantial undernourishment, "
+        "and no observed recovery within three years."
+    )
+    with st.expander("How a priority case is defined"):
+        st.markdown(
+            f"- **Production shock:** at least 10% below the selected comparison measure  \n"
+            f"- **Food vulnerability:** undernourishment of at least {undernourishment_threshold}%  \n"
+            "- **Recovery:** did not return to 95% of the pre-event baseline within three years  \n\n"
+            f"The production rule currently uses **{shock_label.lower()}**. These are transparent "
+            "project rules, not an agency-defined risk score."
+        )
+
+    c1, c2 = st.columns(2)
+    c1.metric("Priority country-event cases", f"{len(priority):,}")
+    c2.metric("Countries represented", f"{priority['ISO3'].nunique():,}")
+
+    if priority.empty:
+        st.info("No cases meet all three priority rules under the current dashboard filters.")
+        return
+
+    display = pd.DataFrame(
+        {
+            "Country": priority["COUNTRY"],
+            "Year": priority["EVENT_YEAR"].astype(int),
+            "Climate event(s)": priority["EVENT_TYPES"],
+            "Production shock (%)": priority[shock_column],
+            "Undernourishment (%)": priority["UNDERNOURISHMENT_PERCENT"],
+            "Recovery": priority["RECOVERY_STATUS"].map(friendly_status),
+            "People affected": priority["TOTAL_AFFECTED_REPORTED"],
+        }
+    )
+    table_event = st.dataframe(
+        display,
+        hide_index=True,
+        use_container_width=True,
+        height=min(420, 38 + len(display) * 35),
+        column_config={
+            "Production shock (%)": st.column_config.NumberColumn(format="%.1f%%"),
+            "Undernourishment (%)": st.column_config.NumberColumn(format="%.1f%%"),
+            "People affected": st.column_config.NumberColumn(format="localized"),
+        },
+        key=f"priority_country_table_{shock_column}",
+        on_select="rerun",
+        selection_mode="single-row",
+    )
+    st.caption("Select a row to open that event's summary.")
+
+    selected_rows = table_event.selection.rows
+    if not selected_rows:
+        return
+
+    row = priority.iloc[selected_rows[0]]
+    event_year = int(row["EVENT_YEAR"])
+    st.markdown(f"#### Selected case: {row['COUNTRY']}, {event_year}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Climate event(s)", str(row["EVENT_TYPES"]))
+    c2.metric(shock_label, percent(row[shock_column]))
+    c3.metric("Undernourishment", percent(row["UNDERNOURISHMENT_PERCENT"]))
+    c4.metric("People affected", fmt_number(row["TOTAL_AFFECTED_REPORTED"]))
+    st.warning(
+        f"{row['COUNTRY']}'s production was {abs(float(row[shock_column])):.1f}% below its "
+        f"comparison level during or immediately after {str(row['EVENT_TYPES']).lower()} in "
+        f"{event_year}, and it had not returned to the project's recovery threshold within three years."
+    )
+
+
 def apply_filters(events: pd.DataFrame) -> pd.DataFrame:
     filtered = events.copy()
     selected_years = st.sidebar.slider(
@@ -339,6 +424,9 @@ def overview_tab(
         render_country_snapshot(events, selected_iso3, shock_column, shock_label)
     else:
         st.info("Select a country on the map to open its country snapshot here.")
+
+    st.divider()
+    render_priority_explorer(events, shock_column, shock_label)
 
     st.divider()
     st.markdown("### Supporting context")
