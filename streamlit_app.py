@@ -5,7 +5,6 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import requests
 import snowflake.connector
 import streamlit as st
 
@@ -133,91 +132,6 @@ def query_dataframe(_connection: Any, sql: str) -> pd.DataFrame:
         return pd.DataFrame(cursor.fetchall(), columns=columns)
     finally:
         cursor.close()
-
-
-def snowflake_base_url(account: str) -> str:
-    host = account.strip().replace("https://", "").replace("http://", "").rstrip("/")
-    if not host.endswith(".snowflakecomputing.com"):
-        host = f"{host}.snowflakecomputing.com"
-    return f"https://{host}"
-
-
-def collect_agent_artifacts(payload: dict[str, Any]) -> tuple[str, list[dict[str, Any]], list[str], list[str]]:
-    response_text = "\n\n".join(
-        item.get("text", "")
-        for item in payload.get("content", [])
-        if item.get("type") == "text" and item.get("text")
-    ).strip()
-    tables: list[dict[str, Any]] = []
-    sql_statements: list[str] = []
-
-    def walk(value: Any) -> None:
-        if isinstance(value, dict):
-            result_set = value.get("result_set")
-            if isinstance(result_set, dict) and result_set.get("data") is not None:
-                metadata = result_set.get("resultSetMetaData", {})
-                columns = [column.get("name", "Column") for column in metadata.get("rowType", [])]
-                tables.append({"columns": columns, "rows": result_set.get("data", [])})
-            sql = value.get("sql")
-            if isinstance(sql, str) and sql.strip() and sql not in sql_statements:
-                sql_statements.append(sql)
-            for key, child in value.items():
-                if key != "result_set":
-                    walk(child)
-        elif isinstance(value, list):
-            for child in value:
-                walk(child)
-
-    walk(payload.get("content", []))
-    warning_messages = [
-        warning.get("message", "")
-        for warning in payload.get("warnings", [])
-        if warning.get("message")
-    ]
-    if not response_text:
-        response_text = "The agent completed the request but did not return a written summary."
-    return response_text, tables, sql_statements, warning_messages
-
-
-def run_resilience_agent(
-    account: str,
-    token: str,
-    conversation: list[dict[str, Any]],
-) -> dict[str, Any]:
-    endpoint = (
-        f"{snowflake_base_url(account)}/api/v2/databases/FAOSTAT_DB/schemas/ANALYTICS/"
-        "agents/FOOD_SYSTEM_RESILIENCE_AGENT:run"
-    )
-    api_messages = [
-        {
-            "role": message["role"],
-            "content": [{"type": "text", "text": message["text"]}],
-        }
-        for message in conversation[-8:]
-    ]
-    response = requests.post(
-        endpoint,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        json={
-            "messages": api_messages,
-            "background": False,
-            "stream": False,
-            "tool_choice": {"type": "auto"},
-        },
-        timeout=180,
-    )
-    if not response.ok:
-        try:
-            error_detail = response.json().get("message", response.text)
-        except ValueError:
-            error_detail = response.text
-        raise RuntimeError(f"Snowflake Agent request failed ({response.status_code}): {error_detail[:800]}")
-    return response.json()
 
 
 def vulnerability_band(value: Any) -> str:
@@ -888,97 +802,301 @@ def assumptions_tab(events: pd.DataFrame) -> None:
     )
 
 
-def ask_data_tab(account: str, token: str) -> None:
-    st.subheader("Ask the Data")
+def guided_explorer_tab(
+    events: pd.DataFrame,
+    production: pd.DataFrame,
+    shock_column: str,
+    shock_label: str,
+) -> None:
+    st.subheader("Guided Data Explorer")
     st.write(
-        "Ask questions in everyday language. The Snowflake agent uses the project's governed "
-        "definitions for production shock, recovery, food vulnerability, and priority cases."
+        "Choose a question and adjust the controls. The answer is calculated directly from "
+        "the filtered Snowflake data, so every result can be traced back to the underlying rows."
     )
     st.caption(
-        "The assistant can summarize patterns in this dataset. Its answers show associations, not proof "
-        "that a recorded disaster caused a production change."
+        "Results follow the event years, hazards, undernourishment categories, follow-up setting, "
+        "and shock measure selected in the dashboard sidebar."
     )
 
-    if not token:
-        st.info("Add the Snowflake programmatic access token to the app secrets to enable this tab.")
-        return
-
-    if "resilience_chat" not in st.session_state:
-        st.session_state["resilience_chat"] = []
-
-    header_left, header_right = st.columns([4, 1])
-    with header_right:
-        if st.button("Clear conversation", use_container_width=True):
-            st.session_state["resilience_chat"] = []
-            st.rerun()
-
-    for message in st.session_state["resilience_chat"]:
-        with st.chat_message(message["role"]):
-            st.markdown(message["text"])
-            for table in message.get("tables", []):
-                if table["columns"]:
-                    st.dataframe(
-                        pd.DataFrame(table["rows"], columns=table["columns"]),
-                        hide_index=True,
-                        use_container_width=True,
-                    )
-            if message.get("sql"):
-                with st.expander("SQL used by Snowflake"):
-                    for statement in message["sql"]:
-                        st.code(statement, language="sql")
-            for warning in message.get("warnings", []):
-                st.warning(warning)
-
-    suggested_questions = [
-        "Which countries meet all three priority rules?",
-        "Which drought cases had the largest detrended production drops?",
-        "How do recovery outcomes differ by disaster type?",
+    questions = [
+        "Which countries had the largest production shocks?",
+        "Which countries meet the priority rules?",
+        "How do outcomes compare by disaster type?",
+        "What happened in one country's event history?",
     ]
-    selected_suggestion = None
-    if not st.session_state["resilience_chat"]:
-        st.markdown("**Try one of these:**")
-        suggestion_columns = st.columns(3)
-        for index, question in enumerate(suggested_questions):
-            with suggestion_columns[index]:
-                if st.button(question, key=f"suggested_question_{index}", use_container_width=True):
-                    selected_suggestion = question
+    question = st.selectbox("What would you like to explore?", questions)
 
-    typed_question = st.chat_input("Ask about countries, disasters, production shocks, or recovery")
-    question = typed_question or selected_suggestion
-    if not question:
-        return
+    if question == questions[0]:
+        top_n = st.slider("Number of countries to show", 5, 20, 10)
+        ranked = (
+            events.dropna(subset=[shock_column])
+            .sort_values(shock_column)
+            .drop_duplicates("ISO3")
+            .head(top_n)
+            .copy()
+        )
+        if ranked.empty:
+            st.warning("No measured production shocks match the current dashboard filters.")
+            return
 
-    st.session_state["resilience_chat"].append({"role": "user", "text": question})
-    with st.spinner("Snowflake is analyzing the resilience data..."):
-        try:
-            payload = run_resilience_agent(
-                account,
-                token,
-                st.session_state["resilience_chat"],
+        worst = ranked.iloc[0]
+        st.markdown(
+            f"""<div class="callout"><strong>Answer:</strong> Among the current results,
+            <strong>{worst['COUNTRY']}</strong> had the deepest measured shock in
+            <strong>{int(worst['EVENT_YEAR'])}</strong>: {percent(worst[shock_column])}
+            ({worst['EVENT_TYPES']}). More negative values indicate production farther below
+            the selected benchmark.</div>""",
+            unsafe_allow_html=True,
+        )
+
+        chart_data = ranked.sort_values(shock_column, ascending=False)
+        fig = px.bar(
+            chart_data,
+            x=shock_column,
+            y="COUNTRY",
+            orientation="h",
+            color=shock_column,
+            color_continuous_scale=["#B94A48", "#E8C6CF", "#4F7A65"],
+            text=shock_column,
+            hover_data=["EVENT_YEAR", "EVENT_TYPES", "RECOVERY_STATUS"],
+            labels={shock_column: f"{shock_label} (%)", "COUNTRY": ""},
+            title=f"Deepest measured shock for each of the top {len(ranked)} countries",
+        )
+        fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+        fig.update_layout(
+            coloraxis_showscale=False,
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(l=0, r=45, t=50, b=0),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        table = ranked[
+            ["COUNTRY", "EVENT_YEAR", "EVENT_TYPES", shock_column, "RECOVERY_STATUS"]
+        ].copy()
+        table.columns = ["Country", "Event year", "Climate event(s)", shock_label, "Recovery outcome"]
+        table["Recovery outcome"] = table["Recovery outcome"].map(friendly_status)
+        st.dataframe(
+            table,
+            hide_index=True,
+            use_container_width=True,
+            column_config={shock_label: st.column_config.NumberColumn(format="%.1f%%")},
+        )
+
+    elif question == questions[1]:
+        priority_shock_column = "WORST_DETRENDED_CHANGE_PERCENT_T_TO_T1"
+        priority_shock_label = "Detrended shock, T to T+1"
+        control_a, control_b = st.columns(2)
+        with control_a:
+            minimum_undernourishment = st.slider(
+                "Minimum undernourishment", 0, 50, 20, 1, format="%d%%"
             )
-            text, tables, sql_statements, warnings = collect_agent_artifacts(payload)
-            st.session_state["resilience_chat"].append(
+        with control_b:
+            minimum_drop = st.slider(
+                "Minimum detrended production drop", 0, 40, 10, 1, format="%d%%"
+            )
+
+        priority = events[
+            events["HAS_FULL_3_YEAR_FOLLOWUP"].fillna(False)
+            & events["RECOVERY_STATUS"].eq("NOT_RECOVERED_WITHIN_3_YEARS")
+            & events["UNDERNOURISHMENT_PERCENT"].ge(minimum_undernourishment)
+            & events[priority_shock_column].le(-minimum_drop)
+        ].copy()
+
+        country_count = priority["ISO3"].nunique()
+        st.markdown(
+            f"""<div class="callout"><strong>Answer:</strong>
+            <strong>{country_count:,} countries</strong> have {len(priority):,} country-event-year
+            cases meeting all three selected rules: at least {minimum_undernourishment}%
+            undernourishment, a production drop of at least {minimum_drop}%, and no recovery
+            within three years.</div>""",
+            unsafe_allow_html=True,
+        )
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Countries", f"{country_count:,}")
+        c2.metric("Country-event-year cases", f"{len(priority):,}")
+        c3.metric(
+            "Upper-bound hunger estimates",
+            f"{priority['UNDERNOURISHMENT_IS_UPPER_BOUND'].fillna(False).sum():,}",
+        )
+
+        if priority.empty:
+            st.info("No cases meet these settings. Lower one of the thresholds to broaden the search.")
+            return
+
+        fig = px.scatter(
+            priority,
+            x="UNDERNOURISHMENT_PERCENT",
+            y=priority_shock_column,
+            color="EVENT_TYPES",
+            hover_name="COUNTRY",
+            hover_data=["EVENT_YEAR", "RECOVERY_STATUS"],
+            labels={
+                "UNDERNOURISHMENT_PERCENT": "Undernourishment (%)",
+                priority_shock_column: f"{priority_shock_label} (%)",
+                "EVENT_TYPES": "Climate event(s)",
+            },
+            title="Priority cases: vulnerability and production shock",
+        )
+        fig.add_vline(x=minimum_undernourishment, line_dash="dot", line_color=COLORS["gray"])
+        fig.add_hline(y=-minimum_drop, line_dash="dot", line_color=COLORS["gray"])
+        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig, use_container_width=True)
+
+        table = priority.sort_values(priority_shock_column)[
+            [
+                "COUNTRY",
+                "EVENT_YEAR",
+                "EVENT_TYPES",
+                priority_shock_column,
+                "UNDERNOURISHMENT_PERCENT",
+                "UNDERNOURISHMENT_IS_UPPER_BOUND",
+            ]
+        ].copy()
+        table.columns = [
+            "Country",
+            "Event year",
+            "Climate event(s)",
+            priority_shock_label,
+            "Undernourishment",
+            "Upper-bound estimate",
+        ]
+        st.dataframe(
+            table,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                priority_shock_label: st.column_config.NumberColumn(format="%.1f%%"),
+                "Undernourishment": st.column_config.NumberColumn(format="%.1f%%"),
+            },
+        )
+
+    elif question == questions[2]:
+        rows = []
+        for hazard, event_count_column in HAZARDS.items():
+            hazard_cases = events[
+                events[event_count_column].gt(0) & events[shock_column].notna()
+            ]
+            complete = hazard_cases[
+                hazard_cases["HAS_FULL_3_YEAR_FOLLOWUP"].fillna(False)
+            ]
+            not_recovered_rate = (
+                complete["RECOVERY_STATUS"].eq("NOT_RECOVERED_WITHIN_3_YEARS").mean() * 100
+                if not complete.empty
+                else np.nan
+            )
+            rows.append(
                 {
-                    "role": "assistant",
-                    "text": text,
-                    "tables": tables,
-                    "sql": sql_statements,
-                    "warnings": warnings,
+                    "Disaster type": hazard,
+                    "Country-event-year cases": len(hazard_cases),
+                    "Countries": hazard_cases["ISO3"].nunique(),
+                    "Median production shock": hazard_cases[shock_column].median(),
+                    "Not recovered within 3 years": not_recovered_rate,
                 }
             )
-        except Exception as exc:
-            st.session_state["resilience_chat"].append(
-                {
-                    "role": "assistant",
-                    "text": (
-                        "I could not reach the Snowflake resilience agent. Confirm that "
-                        "`18_create_resilience_semantic_agent.sql` completed successfully and that "
-                        "the app secret contains the current programmatic access token."
-                    ),
-                    "warnings": [str(exc)],
-                }
-            )
-    st.rerun()
+
+        comparison = pd.DataFrame(rows).sort_values("Median production shock")
+        deepest = comparison.iloc[0]
+        st.markdown(
+            f"""<div class="callout"><strong>Answer:</strong>
+            <strong>{deepest['Disaster type']}</strong> has the deepest median measured production
+            shock under the current filters at {percent(deepest['Median production shock'])}.
+            This is a comparison of associated country-event-year outcomes, not proof that the
+            disaster type caused the change.</div>""",
+            unsafe_allow_html=True,
+        )
+
+        fig = px.bar(
+            comparison.sort_values("Median production shock", ascending=False),
+            x="Median production shock",
+            y="Disaster type",
+            orientation="h",
+            text="Median production shock",
+            color="Median production shock",
+            color_continuous_scale=["#B94A48", "#E8C6CF", "#4F7A65"],
+            labels={"Median production shock": f"Median {shock_label.lower()} (%)"},
+            title="Typical production shock by disaster type",
+        )
+        fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+        fig.update_layout(
+            coloraxis_showscale=False,
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(
+            comparison,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Median production shock": st.column_config.NumberColumn(format="%.1f%%"),
+                "Not recovered within 3 years": st.column_config.NumberColumn(format="%.1f%%"),
+            },
+        )
+        st.caption(
+            "A country-year containing more than one disaster type appears in each relevant row "
+            "of this comparison."
+        )
+
+    else:
+        countries = sorted(events["COUNTRY"].dropna().unique())
+        selected_country = st.selectbox("Choose a country", countries)
+        country_events = events[events["COUNTRY"].eq(selected_country)].sort_values("EVENT_YEAR")
+        measured = country_events.dropna(subset=[shock_column])
+
+        if measured.empty:
+            st.info("This country has no measured shocks under the current filters.")
+            return
+
+        worst = measured.loc[measured[shock_column].idxmin()]
+        st.markdown(
+            f"""<div class="callout"><strong>Answer:</strong> The deepest measured shock for
+            <strong>{selected_country}</strong> occurred in <strong>{int(worst['EVENT_YEAR'])}</strong>
+            following {worst['EVENT_TYPES']}: {percent(worst[shock_column])}. Its recovery outcome
+            was <strong>{friendly_status(worst['RECOVERY_STATUS'])}</strong>.</div>""",
+            unsafe_allow_html=True,
+        )
+
+        fig = px.line(
+            measured,
+            x="EVENT_YEAR",
+            y=shock_column,
+            markers=True,
+            color="RECOVERY_STATUS",
+            hover_data=["EVENT_TYPES", "UNDERNOURISHMENT_PERCENT"],
+            labels={
+                "EVENT_YEAR": "Event year",
+                shock_column: f"{shock_label} (%)",
+                "RECOVERY_STATUS": "Recovery outcome",
+            },
+            title=f"{selected_country}: measured shocks across event years",
+            color_discrete_map={
+                "MAINTAINED": COLORS["green"],
+                "RECOVERED": COLORS["gold"],
+                "NOT_RECOVERED_WITHIN_3_YEARS": COLORS["red"],
+                "FOLLOW_UP_INCOMPLETE": COLORS["gray"],
+            },
+        )
+        fig.add_hline(y=0, line_dash="dot", line_color=COLORS["gray"])
+        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig, use_container_width=True)
+
+        event_year = st.selectbox(
+            "Open the production timeline for an event year",
+            measured["EVENT_YEAR"].astype(int).tolist(),
+            index=measured.index.get_loc(worst.name),
+        )
+        selected_row = measured[measured["EVENT_YEAR"].eq(event_year)].iloc[0]
+        render_production_timeline(
+            selected_row,
+            production,
+            chart_key=f"guided_timeline_{selected_row['ISO3']}_{int(event_year)}",
+        )
+        render_country_takeaway(selected_row, shock_column)
+
+
+
 
 
 def methodology_tab() -> None:
@@ -1039,10 +1157,6 @@ with st.sidebar:
         role = st.text_input("Role", value="ACCOUNTADMIN")
         connect_clicked = st.button("Connect", type="primary", use_container_width=True)
         st.caption("The credential is used for this session and is not written to the project files.")
-
-# In cloud mode, prefer a separate token secret when supplied. In local mode,
-# reuse the credential entered in the sidebar so a PAT can power both SQL and Agent calls.
-agent_token = secret_value("token", password)
 
 if cloud_connection or connect_clicked:
     st.session_state["connect_requested"] = True
@@ -1114,15 +1228,15 @@ if filtered_events.empty:
     st.warning("No cases match the current filters.")
     st.stop()
 
-overview, country, ask_data, assumptions, methods = st.tabs(
-    ["Global overview", "Country deep dive", "Ask the Data", "Assumptions Lab", "Methodology"]
+overview, country, guided, assumptions, methods = st.tabs(
+    ["Global overview", "Country deep dive", "Guided explorer", "Assumptions Lab", "Methodology"]
 )
 with overview:
     overview_tab(filtered_events, filtered_hazards, production_df, shock_column, shock_label)
 with country:
     country_tab(filtered_events, production_df, shock_column, shock_label)
-with ask_data:
-    ask_data_tab(account, agent_token)
+with guided:
+    guided_explorer_tab(filtered_events, production_df, shock_column, shock_label)
 with assumptions:
     assumptions_tab(filtered_events)
 with methods:

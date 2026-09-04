@@ -12,9 +12,8 @@ difficulty recovering.
 The app reads prepared analytical views in Snowflake. No raw FAOSTAT or EM-DAT
 files are stored in this repository.
 
-The **Ask the Data** tab uses a Snowflake semantic view and Cortex Agent. Run
-`sql/18_create_resilience_semantic_agent.sql` in Snowsight as `ACCOUNTADMIN`
-after the detrended-shock view exists.
+The **Guided explorer** calculates its answers directly from the prepared
+Snowflake data and does not require Cortex Agents or a paid AI service.
 
 ## Run locally
 
@@ -31,10 +30,6 @@ after the detrended-shock view exists.
    field, replacing the placeholders with the Snowflake username and a
    role-restricted programmatic access token.
 4. Deploy the app.
-
-The same programmatic access token is used for the Snowflake connection and
-the Cortex Agent request. You may store it as `password`; an optional `token`
-entry is also supported if you want to keep those values separate.
 
 When cloud secrets are configured, the login form is hidden and the app
 connects automatically. Never commit a real password, private key, or access
