@@ -1016,7 +1016,6 @@ st.write(
 )
 
 stored_password = secret_value("password", os.getenv("SNOWFLAKE_PASSWORD", ""))
-agent_token = secret_value("token", stored_password)
 cloud_connection = bool(stored_password)
 
 with st.sidebar:
@@ -1034,12 +1033,16 @@ with st.sidebar:
         st.header("Snowflake connection")
         account = st.text_input("Account", value="biofiay-oi65812")
         user = st.text_input("Username", value="jrapson")
-        password = st.text_input("Password", value="", type="password")
+        password = st.text_input("Password or access token", value="", type="password")
         warehouse = st.text_input("Warehouse", value="FAOSTAT_WH")
         database = st.text_input("Database", value="FAOSTAT_DB")
         role = st.text_input("Role", value="ACCOUNTADMIN")
         connect_clicked = st.button("Connect", type="primary", use_container_width=True)
-        st.caption("The password is used for this session and is not written to the project files.")
+        st.caption("The credential is used for this session and is not written to the project files.")
+
+# In cloud mode, prefer a separate token secret when supplied. In local mode,
+# reuse the credential entered in the sidebar so a PAT can power both SQL and Agent calls.
+agent_token = secret_value("token", password)
 
 if cloud_connection or connect_clicked:
     st.session_state["connect_requested"] = True
