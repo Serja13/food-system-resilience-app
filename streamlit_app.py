@@ -326,6 +326,70 @@ def render_production_timeline(
         )
 
 
+def render_country_takeaway(row: Any, shock_column: str) -> None:
+    country = str(row["COUNTRY"])
+    event_year = int(row["EVENT_YEAR"])
+    event_types = str(row["EVENT_TYPES"]).lower()
+    shock = row[shock_column]
+    undernourishment = row["UNDERNOURISHMENT_PERCENT"]
+    status = str(row["RECOVERY_STATUS"])
+
+    st.markdown("#### What this result suggests")
+    if pd.isna(shock):
+        st.info(
+            f"The available production history is not sufficient to classify {country}'s response "
+            f"to {event_types} in {event_year}."
+        )
+    elif float(shock) <= -10 and pd.notna(undernourishment) and float(undernourishment) >= 20 \
+            and status == "NOT_RECOVERED_WITHIN_3_YEARS":
+        st.error(
+            f"**High-concern pattern.** Production fell {abs(float(shock)):.1f}% below its comparison "
+            f"level, undernourishment was {float(undernourishment):.1f}%, and production had not "
+            "returned to the recovery threshold within three years. This combination suggests a "
+            "food system that may have limited capacity to absorb the shock."
+        )
+    elif float(shock) <= -10 and status == "RECOVERED":
+        recovery_years = (
+            f" within {int(row['RECOVERY_YEARS'])} year(s)"
+            if pd.notna(row["RECOVERY_YEARS"])
+            else ""
+        )
+        st.warning(
+            f"**Significant but temporary production shock.** Production fell "
+            f"{abs(float(shock)):.1f}% below its comparison level but returned to the recovery "
+            f"threshold{recovery_years}."
+        )
+    elif float(shock) <= -10 and status == "NOT_RECOVERED_WITHIN_3_YEARS":
+        st.warning(
+            f"**Persistent production disruption.** Production fell {abs(float(shock)):.1f}% below "
+            "its comparison level and had not returned to the recovery threshold within three years. "
+            "Food vulnerability should be considered separately when interpreting the level of concern."
+        )
+    elif pd.notna(undernourishment) and float(undernourishment) >= 20:
+        st.warning(
+            f"**High underlying food vulnerability, but no major measured production shock.** "
+            f"Undernourishment was {float(undernourishment):.1f}%, while the selected production "
+            "measure did not fall at least 10% below its comparison level."
+        )
+    elif status == "MAINTAINED":
+        st.success(
+            "**Production held up relatively well.** This event-year remained above the project's "
+            "recovery threshold and did not meet the high-concern rule."
+        )
+    else:
+        st.info(
+            "**Mixed result.** The case does not meet the high-concern rule, but it should be read "
+            "alongside the production timeline and available food-vulnerability information."
+        )
+
+    caveats = ["This is an observed pattern and does not prove that the disaster caused the production change."]
+    if not (pd.notna(row["HAS_FULL_3_YEAR_FOLLOWUP"]) and bool(row["HAS_FULL_3_YEAR_FOLLOWUP"])):
+        caveats.append("A complete three-year follow-up period is not available.")
+    if pd.notna(row["UNDERNOURISHMENT_IS_UPPER_BOUND"]) and bool(row["UNDERNOURISHMENT_IS_UPPER_BOUND"]):
+        caveats.append("The undernourishment value is an upper-bound estimate rather than an exact value.")
+    st.caption(" ".join(caveats))
+
+
 def render_priority_explorer(
     events: pd.DataFrame,
     production: pd.DataFrame,
@@ -405,16 +469,12 @@ def render_priority_explorer(
     c2.metric(shock_label, percent(row[shock_column]))
     c3.metric("Undernourishment", percent(row["UNDERNOURISHMENT_PERCENT"]))
     c4.metric("People affected", fmt_number(row["TOTAL_AFFECTED_REPORTED"]))
-    st.warning(
-        f"{row['COUNTRY']}'s production was {abs(float(row[shock_column])):.1f}% below its "
-        f"comparison level during or immediately after {str(row['EVENT_TYPES']).lower()} in "
-        f"{event_year}, and it had not returned to the project's recovery threshold within three years."
-    )
     render_production_timeline(
         row,
         production,
         chart_key=f"priority_timeline_{row['ISO3']}_{event_year}",
     )
+    render_country_takeaway(row, shock_column)
 
 
 def apply_filters(events: pd.DataFrame) -> pd.DataFrame:
@@ -533,6 +593,7 @@ def overview_tab(
                 production,
                 chart_key=f"map_timeline_{selected_iso3}_{int(selected_row['EVENT_YEAR'])}",
             )
+            render_country_takeaway(selected_row, shock_column)
     else:
         st.info("Select a country on the map to open its country snapshot here.")
 
@@ -650,6 +711,7 @@ def country_tab(
         production,
         chart_key=f"deep_dive_timeline_{row['ISO3']}_{int(event_year)}",
     )
+    render_country_takeaway(row, shock_column)
 
     details = pd.DataFrame(
         {
