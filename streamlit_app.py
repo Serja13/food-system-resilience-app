@@ -161,6 +161,74 @@ def fmt_number(value: Any) -> str:
     return f"{float(value):,.0f}"
 
 
+def friendly_status(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return "No data"
+    return str(value).replace("_", " ").title()
+
+
+def render_country_snapshot(
+    events: pd.DataFrame,
+    iso3: str,
+    shock_column: str,
+    shock_label: str,
+) -> None:
+    country_events = events[events["ISO3"].eq(iso3)].copy()
+    if country_events.empty:
+        return
+
+    measured_events = country_events.dropna(subset=[shock_column])
+    if measured_events.empty:
+        row = country_events.sort_values("EVENT_YEAR").iloc[-1]
+    else:
+        # The lowest value is the deepest production drop versus the selected benchmark.
+        row = measured_events.loc[measured_events[shock_column].idxmin()]
+
+    country = str(row["COUNTRY"])
+    event_year = int(row["EVENT_YEAR"])
+    event_types = str(row["EVENT_TYPES"])
+    shock = row[shock_column]
+    recovery_status = friendly_status(row["RECOVERY_STATUS"])
+
+    st.markdown(f"### {country}")
+    st.caption(
+        "Most severe measured production shock among this country's event years "
+        "that match the current filters."
+    )
+    c1, c2, c3, c4, c5 = st.columns([0.8, 1.5, 1.2, 1.3, 1.1])
+    c1.metric("Year", str(event_year))
+    c2.metric("Climate event(s)", event_types)
+    c3.metric(shock_label, percent(shock))
+    c4.metric("Recovery outcome", recovery_status)
+    c5.metric("Undernourishment", percent(row["UNDERNOURISHMENT_PERCENT"]))
+
+    if pd.isna(shock):
+        shock_text = "does not have enough information to calculate the selected production measure"
+    elif float(shock) < 0:
+        shock_text = f"was {abs(float(shock)):.1f}% below its comparison level"
+    else:
+        shock_text = f"was {float(shock):.1f}% above its comparison level"
+
+    status = str(row["RECOVERY_STATUS"])
+    if status == "MAINTAINED":
+        recovery_text = "Production remained at or above the project's recovery threshold."
+    elif status == "RECOVERED" and pd.notna(row["RECOVERY_YEARS"]):
+        recovery_text = f"It returned to the recovery threshold within {int(row['RECOVERY_YEARS'])} year(s)."
+    elif status == "NOT_RECOVERED_WITHIN_3_YEARS":
+        recovery_text = "It had not returned to the recovery threshold within three years."
+    else:
+        recovery_text = "A complete three-year recovery outcome is not available."
+
+    st.markdown(
+        f'<div class="callout"><b>What happened:</b> During or immediately after '
+        f"{event_types.lower()} in {event_year}, {country}'s food-production index {shock_text}. "
+        f"{recovery_text}<br><br><b>Reported event impact:</b> "
+        f"{fmt_number(row['TOTAL_AFFECTED_REPORTED'])} people affected and "
+        f"{fmt_number(row['TOTAL_DEATHS_REPORTED'])} deaths.</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def apply_filters(events: pd.DataFrame) -> pd.DataFrame:
     filtered = events.copy()
     selected_years = st.sidebar.slider(
@@ -233,6 +301,7 @@ def overview_tab(
             locations="ISO3",
             color="MEDIAN_SHOCK",
             hover_name="COUNTRY",
+            custom_data=["ISO3"],
             hover_data={"EVENT_YEARS": True, "POU": ":.1f", "ISO3": False},
             color_continuous_scale=[COLORS["red"], "#F5E6E8", COLORS["green"]],
             color_continuous_midpoint=0,
@@ -243,8 +312,28 @@ def overview_tab(
             },
             title=f"Median {shock_label.lower()} following focus events",
         )
-        fig.update_layout(margin=dict(l=0, r=0, t=45, b=0), paper_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig, use_container_width=True)
+        fig.update_layout(
+            margin=dict(l=0, r=0, t=45, b=0),
+            paper_bgcolor="rgba(0,0,0,0)",
+            clickmode="event+select",
+        )
+        st.caption("Click a country to see its most severe production shock below the map.")
+        map_event = st.plotly_chart(
+            fig,
+            use_container_width=True,
+            key=f"overview_country_map_{shock_column}",
+            on_select="rerun",
+            selection_mode="points",
+        )
+
+        selected_points = map_event.selection.points
+        if selected_points:
+            point = selected_points[0]
+            selected_iso3 = point.get("location")
+            if not selected_iso3 and point.get("customdata"):
+                selected_iso3 = point["customdata"][0]
+            if selected_iso3:
+                st.session_state["overview_selected_iso3"] = selected_iso3
 
     with right:
         hazard_counts = (
@@ -273,6 +362,13 @@ def overview_tab(
             xaxis_showgrid=False,
         )
         st.plotly_chart(fig, use_container_width=True)
+
+    selected_iso3 = st.session_state.get("overview_selected_iso3")
+    valid_iso3 = set(events["ISO3"].dropna().astype(str))
+    if selected_iso3 in valid_iso3:
+        render_country_snapshot(events, selected_iso3, shock_column, shock_label)
+    else:
+        st.info("Select a country on the map to open its country snapshot.")
 
     left, right = st.columns(2)
     with left:
