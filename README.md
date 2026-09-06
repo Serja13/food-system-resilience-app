@@ -1,11 +1,11 @@
-# After the Shock
+# After the Shock: Humanitarian Aid Prioritization Tool
 
 Food System Resilience Explorer for the 2026 Women in Data Datathon.
 
-The Streamlit app explores how national food production changed during and
-after droughts, wildfires, extreme temperatures, floods, and storms. It also
-highlights whether countries already facing undernourishment had greater
-difficulty recovering.
+The Streamlit app uses historical production shocks, undernourishment,
+recovery outcomes, and reported disaster impact to identify country-disaster
+cases for closer humanitarian and agricultural review. Its transparent
+priority tiers support human review and do not automatically allocate aid.
 
 ## Data
 

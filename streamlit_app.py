@@ -77,6 +77,15 @@ SELECT AREA_CODE_M49, AREA, YEAR, FOOD_PRODUCTION_INDEX
 FROM FAOSTAT_DB.ANALYTICS.VW_FOOD_PRODUCTION_YEAR
 """
 
+POPULATION_SQL = """
+SELECT AREA_CODE_M49, YEAR, VALUE * 1000 AS POPULATION
+FROM FAOSTAT_DB.CLEAN.VW_POPULATION
+WHERE ITEM = 'Population - Est. & Proj.'
+  AND ELEMENT = 'Total Population - Both sexes'
+  AND YEAR BETWEEN 2010 AND 2023
+  AND VALUE IS NOT NULL
+"""
+
 HAZARD_SQL = """
 SELECT DISASTER_NUMBER, ISO3, COUNTRY, START_YEAR, DISASTER_TYPE,
        TOTAL_AFFECTED, TOTAL_DEATHS, TOTAL_DAMAGE_ADJUSTED_000_USD
@@ -477,6 +486,267 @@ def render_priority_explorer(
     render_country_takeaway(row, shock_column)
 
 
+
+
+def aid_priority_tab(events: pd.DataFrame, production: pd.DataFrame) -> None:
+    shock_column = "WORST_DETRENDED_CHANGE_PERCENT_T_TO_T1"
+    shock_label = "Detrended production shock"
+
+    st.subheader("Humanitarian Aid Priority Review")
+    st.markdown(
+        '<div class="callout"><b>Decision supported:</b> Which historical country-disaster '
+        "cases should humanitarian and agricultural recovery teams examine first?</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "This is a historical screening tool, not a live emergency alert or an automatic aid-allocation system."
+    )
+
+    threshold_col1, threshold_col2 = st.columns(2)
+    with threshold_col1:
+        minimum_drop = st.slider(
+            "Severe production drop", 5, 30, 10, 1, format="%d%%",
+            help="A case receives a production warning when its detrended drop reaches this level.",
+        )
+    with threshold_col2:
+        minimum_undernourishment = st.slider(
+            "High undernourishment", 5, 40, 20, 1, format="%d%%",
+            help="A case receives a food-vulnerability warning at or above this prevalence.",
+        )
+
+    screened = events.copy()
+    screened["SEVERE_SHOCK"] = screened[shock_column].le(-minimum_drop)
+    screened["HIGH_UNDERNOURISHMENT"] = screened["UNDERNOURISHMENT_PERCENT"].ge(
+        minimum_undernourishment
+    )
+    screened["PERSISTENT_NON_RECOVERY"] = screened["RECOVERY_STATUS"].eq(
+        "NOT_RECOVERED_WITHIN_3_YEARS"
+    )
+    screened["WARNING_COUNT"] = screened[
+        ["SEVERE_SHOCK", "HIGH_UNDERNOURISHMENT", "PERSISTENT_NON_RECOVERY"]
+    ].sum(axis=1)
+    screened["PRIORITY_TIER"] = np.select(
+        [screened["WARNING_COUNT"].eq(3), screened["WARNING_COUNT"].eq(2)],
+        ["Priority 1", "Priority 2"],
+        default="Monitor",
+    )
+
+    def explain_case(row: pd.Series) -> str:
+        reasons = []
+        if row["SEVERE_SHOCK"]:
+            reasons.append(
+                f"production was {abs(float(row[shock_column])):.1f}% below its expected trend"
+            )
+        if row["HIGH_UNDERNOURISHMENT"]:
+            reasons.append(
+                f"undernourishment was {float(row['UNDERNOURISHMENT_PERCENT']):.1f}%"
+            )
+        if row["PERSISTENT_NON_RECOVERY"]:
+            reasons.append("production did not recover within three years")
+        return "; ".join(reasons) if reasons else "no selected priority thresholds were met"
+
+    def assessment_area(row: pd.Series) -> str:
+        if row["WARNING_COUNT"] == 3:
+            action = "Food assistance and agricultural recovery assessment"
+        elif row["SEVERE_SHOCK"] and row["PERSISTENT_NON_RECOVERY"]:
+            action = "Longer-term production recovery and input-needs assessment"
+        elif row["SEVERE_SHOCK"] and row["HIGH_UNDERNOURISHMENT"]:
+            action = "Food assistance and seed/equipment needs assessment"
+        elif row["HIGH_UNDERNOURISHMENT"] and row["PERSISTENT_NON_RECOVERY"]:
+            action = "Food-security and agricultural recovery assessment"
+        elif row["SEVERE_SHOCK"]:
+            action = "Agricultural damage and production assessment"
+        elif row["HIGH_UNDERNOURISHMENT"]:
+            action = "Food-security monitoring"
+        elif row["PERSISTENT_NON_RECOVERY"]:
+            action = "Production recovery review"
+        else:
+            action = "Continue monitoring"
+
+        affected_share = row.get("AFFECTED_POPULATION_PERCENT")
+        if pd.notna(affected_share) and float(affected_share) >= 10:
+            action = f"Rapid needs and logistics review; {action.lower()}"
+        return action
+
+    def data_caution(row: pd.Series) -> str:
+        cautions = []
+        if pd.isna(row[shock_column]):
+            cautions.append("detrended shock unavailable")
+        if pd.isna(row["UNDERNOURISHMENT_PERCENT"]):
+            cautions.append("undernourishment unavailable")
+        elif pd.notna(row["UNDERNOURISHMENT_IS_UPPER_BOUND"]) and bool(
+            row["UNDERNOURISHMENT_IS_UPPER_BOUND"]
+        ):
+            cautions.append("undernourishment is an upper-bound estimate")
+        if not (
+            pd.notna(row["HAS_FULL_3_YEAR_FOLLOWUP"])
+            and bool(row["HAS_FULL_3_YEAR_FOLLOWUP"])
+        ):
+            cautions.append("follow-up incomplete")
+        if pd.isna(row["TOTAL_AFFECTED_REPORTED"]):
+            cautions.append("people affected not reported")
+        return "; ".join(cautions) if cautions else "no major completeness flags"
+
+    screened["WHY_FLAGGED"] = screened.apply(explain_case, axis=1)
+    screened["ASSESSMENT_AREA"] = screened.apply(assessment_area, axis=1)
+    screened["DATA_CAUTION"] = screened.apply(data_caution, axis=1)
+    tier_order = {"Priority 1": 1, "Priority 2": 2, "Monitor": 3}
+    screened["TIER_ORDER"] = screened["PRIORITY_TIER"].map(tier_order)
+    screened = screened.sort_values(
+        ["TIER_ORDER", "WARNING_COUNT", shock_column, "UNDERNOURISHMENT_PERCENT",
+         "AFFECTED_POPULATION_PERCENT"],
+        ascending=[True, False, True, False, False],
+        na_position="last",
+    ).reset_index(drop=True)
+
+    p1 = screened["PRIORITY_TIER"].eq("Priority 1")
+    p2 = screened["PRIORITY_TIER"].eq("Priority 2")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Priority 1 cases", f"{p1.sum():,}")
+    c2.metric("Priority 2 cases", f"{p2.sum():,}")
+    c3.metric("Priority countries", f"{screened.loc[p1 | p2, 'ISO3'].nunique():,}")
+    c4.metric(
+        "Cases with affected-share data",
+        f"{screened['AFFECTED_POPULATION_PERCENT'].notna().sum():,}",
+    )
+
+    filter_col, row_col = st.columns([2, 1])
+    with filter_col:
+        selected_tiers = st.multiselect(
+            "Cases to include",
+            ["Priority 1", "Priority 2", "Monitor"],
+            default=["Priority 1", "Priority 2"],
+        )
+    with row_col:
+        maximum_rows = st.selectbox("Maximum rows", [10, 25, 50, 100], index=1)
+
+    queue = screened[screened["PRIORITY_TIER"].isin(selected_tiers)].copy()
+    visible_queue = queue.head(maximum_rows)
+    if queue.empty:
+        st.info("No cases match the selected tiers and dashboard filters.")
+        return
+
+    chart_counts = (
+        screened.groupby("PRIORITY_TIER", as_index=False)
+        .size()
+        .rename(columns={"size": "Cases"})
+    )
+    chart_counts["PRIORITY_TIER"] = pd.Categorical(
+        chart_counts["PRIORITY_TIER"],
+        ["Priority 1", "Priority 2", "Monitor"],
+        ordered=True,
+    )
+    chart_counts = chart_counts.sort_values("PRIORITY_TIER")
+    fig = px.bar(
+        chart_counts,
+        x="PRIORITY_TIER",
+        y="Cases",
+        text="Cases",
+        color="PRIORITY_TIER",
+        color_discrete_map={
+            "Priority 1": COLORS["red"],
+            "Priority 2": COLORS["gold"],
+            "Monitor": COLORS["green"],
+        },
+        labels={"PRIORITY_TIER": ""},
+        title="Historical cases by review tier",
+    )
+    fig.update_layout(
+        showlegend=False,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    display = pd.DataFrame(
+        {
+            "Tier": visible_queue["PRIORITY_TIER"],
+            "Country": visible_queue["COUNTRY"],
+            "Year": visible_queue["EVENT_YEAR"].astype(int),
+            "Climate event(s)": visible_queue["EVENT_TYPES"],
+            "Detrended shock": visible_queue[shock_column],
+            "Undernourishment": visible_queue["UNDERNOURISHMENT_PERCENT"],
+            "No recovery in 3 years": visible_queue["PERSISTENT_NON_RECOVERY"],
+            "People affected": visible_queue["TOTAL_AFFECTED_REPORTED"],
+            "Affected share": visible_queue["AFFECTED_POPULATION_PERCENT"],
+            "Deaths reported": visible_queue["TOTAL_DEATHS_REPORTED"],
+            "Adjusted damage (000 USD)": visible_queue["TOTAL_DAMAGE_ADJUSTED_000_USD"],
+            "Why flagged": visible_queue["WHY_FLAGGED"],
+            "Suggested next assessment": visible_queue["ASSESSMENT_AREA"],
+            "Data caution": visible_queue["DATA_CAUTION"],
+        }
+    )
+    table_event = st.dataframe(
+        display,
+        hide_index=True,
+        use_container_width=True,
+        height=min(610, 38 + len(display) * 35),
+        column_config={
+            "Detrended shock": st.column_config.NumberColumn(format="%.1f%%"),
+            "Undernourishment": st.column_config.NumberColumn(format="%.1f%%"),
+            "People affected": st.column_config.NumberColumn(format="localized"),
+            "Affected share": st.column_config.NumberColumn(format="%.1f%%"),
+            "Deaths reported": st.column_config.NumberColumn(format="localized"),
+            "Adjusted damage (000 USD)": st.column_config.NumberColumn(format="localized"),
+        },
+        key="aid_priority_queue",
+        on_select="rerun",
+        selection_mode="single-row",
+    )
+    st.caption(
+        "Select a row for its evidence and production timeline. Reported affected share may exceed "
+        "100% when multiple disasters occurred in one year or the same people were counted more than once."
+    )
+
+    download_columns = [
+        "PRIORITY_TIER", "COUNTRY", "ISO3", "EVENT_YEAR", "EVENT_TYPES",
+        shock_column, "UNDERNOURISHMENT_PERCENT", "RECOVERY_STATUS",
+        "TOTAL_AFFECTED_REPORTED", "AFFECTED_POPULATION_PERCENT",
+        "TOTAL_DEATHS_REPORTED", "TOTAL_DAMAGE_ADJUSTED_000_USD",
+        "WHY_FLAGGED", "ASSESSMENT_AREA", "DATA_CAUTION",
+    ]
+    st.download_button(
+        "Download priority review list (CSV)",
+        data=queue[download_columns].to_csv(index=False).encode("utf-8"),
+        file_name="humanitarian_aid_priority_review.csv",
+        mime="text/csv",
+    )
+
+    selected_rows = table_event.selection.rows
+    if not selected_rows:
+        st.info("Select a case in the table to see why it was flagged.")
+        return
+
+    row = visible_queue.iloc[selected_rows[0]]
+    st.markdown(f"### {row['COUNTRY']}, {int(row['EVENT_YEAR'])}")
+    st.markdown(
+        f"""<div class="callout"><strong>{row['PRIORITY_TIER']}:</strong>
+        {row['WHY_FLAGGED'].capitalize()}.<br><br>
+        <strong>Suggested next assessment:</strong> {row['ASSESSMENT_AREA']}.<br>
+        <strong>Data caution:</strong> {row['DATA_CAUTION']}.</div>""",
+        unsafe_allow_html=True,
+    )
+    d1, d2, d3 = st.columns(3)
+    d1.metric(shock_label, percent(row[shock_column]))
+    d2.metric("Undernourishment", percent(row["UNDERNOURISHMENT_PERCENT"]))
+    d3.metric("Recovery", friendly_status(row["RECOVERY_STATUS"]))
+    d4, d5, d6, d7 = st.columns(4)
+    d4.metric("People affected", fmt_number(row["TOTAL_AFFECTED_REPORTED"]))
+    d5.metric("Affected share", percent(row["AFFECTED_POPULATION_PERCENT"]))
+    d6.metric("Deaths reported", fmt_number(row["TOTAL_DEATHS_REPORTED"]))
+    d7.metric("Adjusted damage (000 USD)", fmt_number(row["TOTAL_DAMAGE_ADJUSTED_000_USD"]))
+
+    render_production_timeline(
+        row,
+        production,
+        chart_key=f"aid_timeline_{row['ISO3']}_{int(row['EVENT_YEAR'])}",
+    )
+    st.warning(
+        "This shortlist supports human review. It should be combined with current field assessments, "
+        "local knowledge, logistics, and verified humanitarian needs before resources are allocated."
+    )
+
+
 def apply_filters(events: pd.DataFrame) -> pd.DataFrame:
     filtered = events.copy()
     selected_years = st.sidebar.slider(
@@ -596,9 +866,6 @@ def overview_tab(
             render_country_takeaway(selected_row, shock_column)
     else:
         st.info("Select a country on the map to open its country snapshot here.")
-
-    st.divider()
-    render_priority_explorer(events, production, shock_column, shock_label)
 
     st.divider()
     st.markdown("### Supporting context")
@@ -1120,6 +1387,15 @@ def methodology_tab() -> None:
         **Food vulnerability:** prevalence of undernourishment is the primary measure. Survey-based food
         insecurity is retained as a separate secondary measure because the methodologies are different.
 
+        **Aid priority tiers:** Priority 1 means all three project warnings are present: a detrended
+        production drop at or beyond the selected threshold, undernourishment at or above the selected
+        threshold, and no recovery within three years. Priority 2 means two warnings are present. These
+        tiers identify cases for further review; they are not an agency standard or an aid-allocation decision.
+
+        **Affected population share:** reported people affected is divided by FAOSTAT total population for
+        the event year. The percentage can exceed 100% when multiple disasters are combined or people are
+        counted more than once, so it is supporting context rather than a ranking rule.
+
         **Interpretation:** the results show associations and recovery patterns. They do not prove that a
         recorded disaster caused the observed production change.
         """
@@ -1127,10 +1403,10 @@ def methodology_tab() -> None:
 
 
 st.title("After the Shock")
-st.markdown("### Food System Resilience Explorer")
+st.markdown("### Humanitarian Aid Prioritization Tool")
 st.write(
-    "Explore how national food production changed during and after climate-related events, "
-    "and whether countries already facing undernourishment had greater difficulty recovering."
+    "Use historical production shocks, undernourishment, recovery outcomes, and reported disaster "
+    "impact to identify country-disaster cases for closer humanitarian and agricultural review."
 )
 
 stored_password = secret_value("password", os.getenv("SNOWFLAKE_PASSWORD", ""))
@@ -1174,6 +1450,7 @@ try:
         connection = connect_snowflake(account, user, password, warehouse, database, role)
         events_df = query_dataframe(connection, EVENT_SQL)
         production_df = query_dataframe(connection, PRODUCTION_SQL)
+        population_df = query_dataframe(connection, POPULATION_SQL)
         hazards_df = query_dataframe(connection, HAZARD_SQL)
 except Exception as exc:
     st.error("Snowflake connection failed. Check the account, username, password, warehouse, and role.")
@@ -1201,6 +1478,26 @@ production_df["FOOD_PRODUCTION_INDEX"] = pd.to_numeric(
     production_df["FOOD_PRODUCTION_INDEX"], errors="coerce"
 )
 hazards_df["START_YEAR"] = pd.to_numeric(hazards_df["START_YEAR"], errors="coerce")
+population_df["YEAR"] = pd.to_numeric(population_df["YEAR"], errors="coerce")
+population_df["POPULATION"] = pd.to_numeric(population_df["POPULATION"], errors="coerce")
+events_df["AREA_CODE_M49_JOIN"] = (
+    events_df["AREA_CODE_M49"].astype("string").str.extract(r"(\d+)", expand=False).str.zfill(3)
+)
+population_df["AREA_CODE_M49_JOIN"] = (
+    population_df["AREA_CODE_M49"].astype("string").str.extract(r"(\d+)", expand=False).str.zfill(3)
+)
+population_year = (
+    population_df.groupby(["AREA_CODE_M49_JOIN", "YEAR"], as_index=False)["POPULATION"].max()
+)
+events_df = events_df.merge(
+    population_year,
+    how="left",
+    left_on=["AREA_CODE_M49_JOIN", "EVENT_YEAR"],
+    right_on=["AREA_CODE_M49_JOIN", "YEAR"],
+)
+events_df["AFFECTED_POPULATION_PERCENT"] = (
+    events_df["TOTAL_AFFECTED_REPORTED"] / events_df["POPULATION"] * 100
+).replace([np.inf, -np.inf], np.nan)
 events_df["POU_CATEGORY"] = events_df["UNDERNOURISHMENT_PERCENT"].apply(vulnerability_band)
 
 st.sidebar.divider()
@@ -1228,9 +1525,11 @@ if filtered_events.empty:
     st.warning("No cases match the current filters.")
     st.stop()
 
-overview, country, guided, assumptions, methods = st.tabs(
-    ["Global overview", "Country deep dive", "Guided explorer", "Assumptions Lab", "Methodology"]
+aid, overview, country, guided, assumptions, methods = st.tabs(
+    ["Aid Priority", "Global overview", "Country deep dive", "Guided explorer", "Assumptions Lab", "Methodology"]
 )
+with aid:
+    aid_priority_tab(filtered_events, production_df)
 with overview:
     overview_tab(filtered_events, filtered_hazards, production_df, shock_column, shock_label)
 with country:
